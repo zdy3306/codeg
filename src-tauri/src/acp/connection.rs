@@ -558,6 +558,7 @@ pub async fn spawn_agent_connection(
         };
 
         let delegation_for_cleanup = delegation_injection.clone();
+        let cleanup_working_dir = working_dir.clone();
         let result = run_connection(
             agent,
             conn_id.clone(),
@@ -591,6 +592,13 @@ pub async fn spawn_agent_connection(
             // companion's ask socket to close (which a reparented/hard-killed
             // agent may never do); the dropped sender declines the tool cleanly.
             inj.questions.cancel_questions_by_parent(&conn_id).await;
+        }
+
+        // Clean up the codeg-mcp entry from QoderCli's settings.local.json
+        // if we injected it via config file.
+        if agent_type == AgentType::QoderCli {
+            let cleanup_cwd = resolve_working_dir(cleanup_working_dir.as_deref());
+            remove_qodercli_mcp_entry(&cleanup_cwd);
         }
 
         if let Err(e) = result {
@@ -1174,6 +1182,198 @@ async fn inject_codeg_mcp(
     })
 }
 
+/// QoderCli does not process `mcpServers` from ACP `session/new`; it only
+/// reads MCP config from its own settings files at startup.  To inject
+/// `codeg-mcp` we write the entry into `${project}/.qoder/settings.local.json`
+/// BEFORE the agent process starts, and remove it on disconnect.
+///
+/// Returns `Some(CompanionInjection)` on success, `None` when injection was
+/// skipped (features disabled, binary missing, or write failed).
+async fn prepare_codeg_mcp_for_qodercli(
+    injection: &DelegationInjection,
+    parent_connection_id: &str,
+    working_dir: &Path,
+) -> Option<CompanionInjection> {
+    let delegation_enabled = injection.broker.config_snapshot().await.enabled;
+    let feedback_enabled = injection.feedback.is_enabled().await;
+    let ask_enabled = injection.ask.is_enabled().await;
+    let sessions_enabled = injection.sessions.is_enabled().await;
+    let features_arg = companion_features_arg(
+        delegation_enabled,
+        feedback_enabled,
+        ask_enabled,
+        sessions_enabled,
+    )?;
+    let Some(binary_path) = locate_codeg_mcp_binary() else {
+        eprintln!(
+            "[delegation][WARN] codeg-mcp companion binary not found (checked CODEG_MCP_BIN, \
+             exe sibling, and PATH); skipping delegate_to_agent / check_user_feedback / \
+             ask_user_question / get_session_info tool injection for QoderCli connection \
+             {parent_connection_id}. Reinstall codeg or set CODEG_MCP_BIN to fix."
+        );
+        return None;
+    };
+    let token = uuid::Uuid::new_v4().to_string();
+    injection
+        .tokens
+        .register(
+            token.clone(),
+            crate::acp::delegation::listener::TokenEntry {
+                parent_connection_id: parent_connection_id.to_string(),
+                working_dir: working_dir.to_path_buf(),
+            },
+        )
+        .await;
+
+    // Build the MCP server entry for the companion.
+    let mut server = McpServerStdio::new("codeg-mcp", binary_path.clone());
+    server = server.args(vec![
+        "--parent-connection-id".to_string(),
+        parent_connection_id.to_string(),
+        "--socket-path".to_string(),
+        injection.socket_path.to_string_lossy().to_string(),
+        "--token".to_string(),
+        token.clone(),
+        "--parent-pid".to_string(),
+        std::process::id().to_string(),
+        "--features".to_string(),
+        features_arg,
+    ]);
+    // Add to the MCP server list so it's also sent via session/new (for agents
+    // that DO process mcpServers, this is a harmless duplicate).
+    // Note: for QoderCli this is not needed since it reads from config file,
+    // but we skip this since the servers list is not passed here.
+
+    // Write the entry into QoderCli's project-level settings so it reads it
+    // at startup.
+    if let Err(e) = write_qodercli_mcp_entry(working_dir, &server) {
+        eprintln!(
+            "[delegation][WARN] failed to write codeg-mcp entry to QoderCli \
+             settings.local.json for connection {parent_connection_id}: {e}"
+        );
+        // Still return the injection so token registration / cleanup works;
+        // the agent just won't have the companion via config file.
+    }
+
+    Some(CompanionInjection {
+        token,
+        feedback_available: feedback_enabled,
+    })
+}
+
+/// Write the `codeg-mcp` MCP server entry into `${project}/.qoder/settings.local.json`.
+/// If the file doesn't exist it is created; if it exists the `mcpServers` map
+/// is merged (existing `codeg-mcp` entry is overwritten, other entries preserved).
+fn write_qodercli_mcp_entry(project_dir: &Path, server: &McpServerStdio) -> Result<(), String> {
+    let settings_dir = project_dir.join(".qoder");
+    std::fs::create_dir_all(&settings_dir)
+        .map_err(|e| format!("failed to create .qoder dir: {e}"))?;
+    let settings_path = settings_dir.join("settings.local.json");
+
+    // Read existing config or start with empty object.
+    let mut root: serde_json::Value = if settings_path.exists() {
+        let raw = std::fs::read_to_string(&settings_path)
+            .map_err(|e| format!("failed to read settings.local.json: {e}"))?;
+        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Ensure root is an object.
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+
+    // Ensure mcpServers is an object.
+    if !root.get("mcpServers").is_some_and(|v| v.is_object()) {
+        root["mcpServers"] = serde_json::json!({});
+    }
+
+    // Serialize the McpServerStdio into the config format.
+    let command = server
+        .command
+        .to_str()
+        .unwrap_or_default()
+        .to_string();
+    let args: Vec<String> = server.args.clone();
+    let env: serde_json::Map<String, serde_json::Value> = server
+        .env
+        .iter()
+        .map(|e| (e.name.clone(), serde_json::Value::String(e.value.clone())))
+        .collect();
+
+    let mut entry = serde_json::json!({
+        "type": "stdio",
+        "command": command,
+    });
+    if !args.is_empty() {
+        entry["args"] = serde_json::to_value(&args).unwrap_or_default();
+    }
+    if !env.is_empty() {
+        entry["env"] = serde_json::Value::Object(env);
+    }
+
+    root["mcpServers"]["codeg-mcp"] = entry;
+
+    let pretty = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("failed to serialize settings: {e}"))?;
+    std::fs::write(&settings_path, pretty)
+        .map_err(|e| format!("failed to write settings.local.json: {e}"))?;
+    eprintln!(
+        "[delegation] wrote codeg-mcp entry to {}",
+        settings_path.display()
+    );
+    Ok(())
+}
+
+/// Remove the `codeg-mcp` entry from `${project}/.qoder/settings.local.json`.
+/// If the file only contained `codeg-mcp` in `mcpServers`, the entire
+/// `mcpServers` object (or even the file) is cleaned up.
+fn remove_qodercli_mcp_entry(project_dir: &Path) {
+    let settings_path = project_dir.join(".qoder").join("settings.local.json");
+    if !settings_path.exists() {
+        return;
+    }
+    let Ok(raw) = std::fs::read_to_string(&settings_path) else {
+        return;
+    };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+
+    let changed = if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut())
+    {
+        servers.remove("codeg-mcp").is_some()
+    } else {
+        false
+    };
+
+    if changed {
+        // If mcpServers is now empty, remove it too.
+        if let Some(servers) = root.get("mcpServers").and_then(|v| v.as_object()) {
+            if servers.is_empty() {
+                if let Some(obj) = root.as_object_mut() {
+                    obj.remove("mcpServers");
+                }
+            }
+        }
+        // If the entire root is empty, remove the file.
+        if root.as_object().is_some_and(|o| o.is_empty()) {
+            let _ = std::fs::remove_file(&settings_path);
+            eprintln!(
+                "[delegation] removed empty settings.local.json ({})",
+                settings_path.display()
+            );
+        } else if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+            let _ = std::fs::write(&settings_path, pretty);
+            eprintln!(
+                "[delegation] removed codeg-mcp entry from {}",
+                settings_path.display()
+            );
+        }
+    }
+}
+
 /// Resolve an MCP server `command` to an absolute path.
 ///
 /// The ACP spec requires `McpServerStdio.command` to be an absolute path.
@@ -1300,6 +1500,30 @@ async fn run_connection(
     let perms = pending_perms.clone();
     let state_outer = Arc::clone(&state);
 
+    // For QoderCli, inject codeg-mcp via config file BEFORE the agent starts.
+    // QoderCli reads MCP config from ~/.qoder/settings.json / .qoder/settings.local.json
+    // at startup and does NOT process mcpServers from ACP session/new.
+    let qodercli_companion = if agent_type == AgentType::QoderCli {
+        if let Some(inj) = delegation_injection.as_ref() {
+            prepare_codeg_mcp_for_qodercli(
+                inj,
+                &conn_id,
+                &cwd,
+            )
+            .await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Stash the companion info on session state so cleanup can revoke the token.
+    if let Some(ref injected) = qodercli_companion {
+        let mut s = state.write().await;
+        s.delegation_token = Some(injected.token.clone());
+        s.feedback_tool_available = injected.feedback_available;
+    }
+
     Client
         .builder()
         .name("codeg")
@@ -1369,6 +1593,42 @@ async fn run_connection(
                             responder: Responder<TerminalOutputResponse>,
                             _cx: ConnectionTo<Agent>| {
                     respond_terminal_request(responder, runtime.terminal_output(req).await)?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let runtime = terminal_runtime.clone();
+                async move |req: WaitForTerminalExitRequest,
+                            responder: Responder<WaitForTerminalExitResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    respond_terminal_request(responder, runtime.wait_for_terminal_exit(req).await)?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let runtime = terminal_runtime.clone();
+                async move |req: KillTerminalRequest,
+                            responder: Responder<KillTerminalResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    respond_terminal_request(responder, runtime.kill_terminal(req).await)?;
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let runtime = terminal_runtime.clone();
+                async move |req: ReleaseTerminalRequest,
+                            responder: Responder<ReleaseTerminalResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    respond_terminal_request(responder, runtime.release_terminal(req).await)?;
                     Ok(())
                 }
             },

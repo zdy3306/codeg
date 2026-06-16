@@ -63,10 +63,10 @@ impl QoderCliParser {
 
         let mut session_id: Option<String> = None;
         let mut model: Option<String> = None;
-        let mut _context_window: Option<u64> = None;
         let mut turns: Vec<MessageTurn> = Vec::new();
         let mut current_user_content: Vec<ContentBlock> = Vec::new();
-        let mut _cwd: Option<String> = None;
+        let mut cwd: Option<String> = None;
+        let mut git_branch: Option<String> = None;
         let mut first_timestamp: Option<chrono::DateTime<Utc>> = None;
 
         for line in reader.lines().map_while(Result::ok) {
@@ -90,12 +90,24 @@ impl QoderCliParser {
                         .get("model")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    _context_window = val.get("contextWindow").and_then(|v| v.as_u64());
                     if first_timestamp.is_none() {
                         first_timestamp = Some(parse_timestamp(&val));
                     }
                 }
                 "user" => {
+                    // Fallback: extract session_id from any entry if runtime-config is absent.
+                    if session_id.is_none() {
+                        session_id = val
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    if model.is_none() {
+                        model = val
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
                     if let Some(message) = val.get("message") {
                         let role = message
                             .get("role")
@@ -105,10 +117,18 @@ impl QoderCliParser {
                             let content = message.get("content");
                             match content {
                                 Some(serde_json::Value::String(text)) => {
-                                    _cwd = val
-                                        .get("cwd")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string());
+                                    if cwd.is_none() {
+                                        cwd = val
+                                            .get("cwd")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                    }
+                                    if git_branch.is_none() {
+                                        git_branch = val
+                                            .get("gitBranch")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                    }
                                     let timestamp = parse_timestamp(&val);
                                     if !current_user_content.is_empty() {
                                         turns.push(MessageTurn {
@@ -164,7 +184,32 @@ impl QoderCliParser {
                     }
                 }
                 "assistant" => {
+                    // Fallback: extract session_id from any entry if runtime-config is absent.
+                    if session_id.is_none() {
+                        session_id = val
+                            .get("sessionId")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    if model.is_none() {
+                        model = val
+                            .get("model")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
                     if let Some(message) = val.get("message") {
+                        if cwd.is_none() {
+                            cwd = val
+                                .get("cwd")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
+                        if git_branch.is_none() {
+                            git_branch = val
+                                .get("gitBranch")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                        }
                         let content_blocks = message.get("content");
                         if let Some(serde_json::Value::Array(blocks)) = content_blocks {
                             let timestamp = parse_timestamp(&val);
@@ -287,11 +332,10 @@ impl QoderCliParser {
         }
 
         let sid = session_id?;
-        // Decode the encoded directory name back to the actual workspace path.
-        // QoderCli encodes "D:\codeg" as "D--codeg" (replacing ':' and '\' with '-').
-        let encoded_dir = path.parent()?.file_name()?.to_string_lossy().to_string();
-        let decoded_path = decode_qodercli_folder_path(&encoded_dir);
-        let folder_path = decoded_path.unwrap_or_else(|| {
+        // Use the actual cwd from JSONL entries as the folder_path.
+        // The encoded directory name in ~/.qoder/projects/ is lossy for paths
+        // containing dashes, so we cannot reliably decode it back.
+        let folder_path = cwd.unwrap_or_else(|| {
             path.parent()
                 .and_then(|p| p.to_str())
                 .unwrap_or(".")
@@ -318,7 +362,7 @@ impl QoderCliParser {
             ended_at: turns.last().and_then(|t| t.completed_at),
             message_count: turns.len() as u32,
             model,
-            git_branch: None,
+            git_branch,
             parent_id: None,
             parent_tool_use_id: None,
             delegation_call_id: None,
@@ -381,42 +425,84 @@ fn resolve_qodercli_base_dir() -> PathBuf {
         .join(".qoder")
 }
 
-/// Decode QoderCli's encoded folder path back to the original workspace path.
-/// QoderCli encodes "D:\codeg" as "D--codeg" (replacing ':' and '\' with '-').
-/// On Windows: "D--codeg" → "D:\codeg", "C--Users-zdy33-proj" → "C:\Users\zdy33\proj"
-/// On Unix: "/home/user/project" stays as-is (no encoding needed).
-fn decode_qodercli_folder_path(encoded: &str) -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        // Windows paths like "D--codeg" or "C--Users-zdy33-proj"
-        // The first '-' after the drive letter represents ':', all others represent '\'
-        let bytes = encoded.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b'-' {
-            // Drive letter found, find the second '-' to split
-            if let Some(pos) = encoded[2..].find('-') {
-                let drive = &encoded[..1];
-                let rest = &encoded[2 + pos + 1..];
-                let decoded_rest = rest.replace('-', "\\");
-                return Some(format!("{}:\\{}", drive, decoded_rest));
-            }
-        }
-        // Fallback: treat as-is
-        Some(encoded.to_string())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Unix paths are not encoded by QoderCli
-        Some(encoded.replace('-', "/"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn make_jsonl(entries: &[&str]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new()
+            .suffix(".jsonl")
+            .tempfile()
+            .unwrap();
+        for entry in entries {
+            writeln!(f, "{entry}").unwrap();
+        }
+        f
+    }
 
     #[test]
-    fn resolve_base_dir() {
+    fn parse_session_with_runtime_config() {
+        let f = make_jsonl(&[
+            r#"{"type":"runtime-config","sessionId":"sid-123","model":"qmodel_latest","timestamp":"2026-01-01T00:00:00Z"}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"hi"},"cwd":"D:\\test","sessionId":"sid-123","gitBranch":"main"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","model":"qmodel_latest","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]},"cwd":"D:\\test","sessionId":"sid-123"}"#,
+        ]);
         let parser = QoderCliParser::new();
-        assert!(parser.base_dir.ends_with(".qoder"));
+        let (summary, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        assert_eq!(summary.id, "sid-123");
+        assert_eq!(summary.model.as_deref(), Some("qmodel_latest"));
+        assert_eq!(summary.folder_path.as_deref(), Some("D:\\test"));
+        assert_eq!(summary.git_branch.as_deref(), Some("main"));
+        assert!(!turns.is_empty());
+    }
+
+    #[test]
+    fn parse_session_without_runtime_config() {
+        // Real QoderCli format: no runtime-config entry, sessionId on user/assistant entries.
+        let f = make_jsonl(&[
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-06-14T10:39:52.062Z","message":{"role":"user","content":"hello"},"cwd":"D:\\xiaogou\\codeg","sessionId":"b49bc65b","gitBranch":"main"}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-06-14T10:39:57.206Z","message":{"id":"c1","type":"message","role":"assistant","model":"qmodel_latest","stop_reason":"end_turn","content":[{"type":"text","text":"Hello!"}]},"cwd":"D:\\xiaogou\\codeg","sessionId":"b49bc65b"}"#,
+            r#"{"type":"last-prompt","sessionId":"b49bc65b","lastPrompt":"hello"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let result = parser.parse_jsonl_file(f.path());
+        assert!(result.is_some(), "parser must not return None when runtime-config is absent");
+        let (summary, turns) = result.unwrap();
+        assert_eq!(summary.id, "b49bc65b");
+        assert_eq!(summary.folder_path.as_deref(), Some("D:\\xiaogou\\codeg"));
+        assert_eq!(summary.git_branch.as_deref(), Some("main"));
+        assert!(!turns.is_empty(), "must have parsed turns");
+    }
+
+    #[test]
+    fn parse_session_without_runtime_config_has_correct_turns() {
+        let f = make_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"ping"},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"a1","type":"message","role":"assistant","model":"m","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"pong"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        // Assistant turn should have thinking + text blocks
+        assert_eq!(turns[1].blocks.len(), 2);
+    }
+
+    #[test]
+    fn parse_empty_session_returns_none() {
+        let f = make_jsonl(&[]);
+        let parser = QoderCliParser::new();
+        assert!(parser.parse_jsonl_file(f.path()).is_none());
+    }
+
+    #[test]
+    fn parse_session_only_last_prompt_returns_none() {
+        let f = make_jsonl(&[
+            r#"{"type":"last-prompt","sessionId":"s1","lastPrompt":"hi"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        assert!(parser.parse_jsonl_file(f.path()).is_none());
     }
 }
