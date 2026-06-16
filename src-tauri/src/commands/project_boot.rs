@@ -305,6 +305,7 @@ fn agent_type_for_skill_id(skill_agent: &str) -> Option<AgentType> {
         "openclaw" => AgentType::OpenClaw,
         "cline" => AgentType::Cline,
         "hermes" => AgentType::Hermes,
+        "qoder-cli" => AgentType::QoderCli,
         _ => return None,
     })
 }

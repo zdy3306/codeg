@@ -5,6 +5,7 @@ pub mod gemini;
 pub mod hermes;
 pub mod openclaw;
 pub mod opencode;
+pub mod qoder;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

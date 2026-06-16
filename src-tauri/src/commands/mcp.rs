@@ -55,6 +55,7 @@ pub enum McpAppType {
     OpenCode,
     Cline,
     Hermes,
+    QoderCli,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -369,6 +370,7 @@ pub async fn mcp_upsert_local_server(
         McpAppType::OpenCode,
         McpAppType::Cline,
         McpAppType::Hermes,
+        McpAppType::QoderCli,
     ];
 
     for app in all_apps {
@@ -424,6 +426,7 @@ pub async fn mcp_remove_server(
             McpAppType::OpenCode,
             McpAppType::Cline,
             McpAppType::Hermes,
+            McpAppType::QoderCli,
         ],
     };
 
@@ -2082,6 +2085,13 @@ fn scan_local_servers() -> Result<Vec<LocalMcpServer>, AppCommandError> {
         entry.1.insert(McpAppType::Hermes);
     }
 
+    for (id, spec) in read_qodercli_servers()? {
+        let entry = merged
+            .entry(id)
+            .or_insert_with(|| (spec.clone(), BTreeSet::new()));
+        entry.1.insert(McpAppType::QoderCli);
+    }
+
     Ok(merged
         .into_iter()
         .map(|(id, (spec, apps))| LocalMcpServer {
@@ -2106,6 +2116,10 @@ fn upsert_server_for_app(app: McpAppType, id: &str, spec: &Value) -> Result<(), 
         McpAppType::OpenClaw => upsert_openclaw_server(id, spec),
         McpAppType::Cline => upsert_cline_server(id, spec),
         McpAppType::Hermes => upsert_hermes_server(id, spec),
+        McpAppType::QoderCli => {
+            // QoderCli MCP servers are managed by qodercli itself; codeg is read-only.
+            Ok(())
+        }
     }
 }
 
@@ -2121,6 +2135,7 @@ pub fn read_servers_for_agent_type(
         AgentType::OpenClaw => read_openclaw_servers(),
         AgentType::Cline => read_cline_servers(),
         AgentType::Hermes => read_hermes_servers(),
+        AgentType::QoderCli => read_qodercli_servers(),
     }
 }
 
@@ -2367,6 +2382,40 @@ fn remove_hermes_server(id: &str) -> Result<bool, AppCommandError> {
     Ok(removed)
 }
 
+fn read_qodercli_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
+    let path = dirs::home_dir()
+        .ok_or_else(|| mcp_configuration_invalid("cannot determine home directory"))?
+        .join(".qoder")
+        .join("settings.json");
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Ok(BTreeMap::new());
+    };
+    let root: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("[MCP] skip QoderCli mcpServers: invalid settings.json: {err}");
+            return Ok(BTreeMap::new());
+        }
+    };
+
+    let mut out = BTreeMap::new();
+    let Some(servers) = root.get("mcpServers").and_then(Value::as_object) else {
+        return Ok(out);
+    };
+
+    for (id, spec) in servers {
+        match canonicalize_spec(spec, "QoderCli config") {
+            Ok(normalized) => {
+                out.insert(id.to_string(), normalized);
+            }
+            Err(err) => {
+                eprintln!("[MCP] skip invalid QoderCli MCP entry id={id}: {err}");
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn remove_server_for_app(app: McpAppType, id: &str) -> Result<bool, AppCommandError> {
     match app {
         McpAppType::ClaudeCode => remove_claude_server(id),
@@ -2376,6 +2425,10 @@ fn remove_server_for_app(app: McpAppType, id: &str) -> Result<bool, AppCommandEr
         McpAppType::OpenClaw => remove_openclaw_server(id),
         McpAppType::Cline => remove_cline_server(id),
         McpAppType::Hermes => remove_hermes_server(id),
+        McpAppType::QoderCli => {
+            // QoderCli MCP servers are managed by qodercli itself; codeg is read-only.
+            Ok(false)
+        }
     }
 }
 

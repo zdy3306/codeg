@@ -6,6 +6,7 @@ export type AgentType =
   | "open_claw"
   | "cline"
   | "hermes"
+  | "qoder_cli"
 
 export type AppErrorCode =
   | "invalid_input"
@@ -416,6 +417,7 @@ export const AGENT_DISPLAY_ORDER: AgentType[] = [
   "open_claw",
   "cline",
   "hermes",
+  "qoder_cli",
 ]
 
 const AGENT_DISPLAY_ORDER_INDEX = new Map(
@@ -436,6 +438,7 @@ export const ALL_AGENT_TYPES: AgentType[] = [
   "open_claw",
   "cline",
   "hermes",
+  "qoder_cli",
 ]
 
 export const MODEL_PROVIDER_AGENT_TYPES: AgentType[] = [
@@ -723,6 +726,7 @@ export const AGENT_LABELS: Record<AgentType, string> = {
   open_claw: "OpenClaw",
   cline: "Cline",
   hermes: "Hermes Agent",
+  qoder_cli: "Qoder CLI",
 }
 
 export const AGENT_COLORS: Record<AgentType, string> = {
@@ -733,6 +737,7 @@ export const AGENT_COLORS: Record<AgentType, string> = {
   open_claw: "bg-emerald-600",
   cline: "bg-purple-500",
   hermes: "bg-amber-500",
+  qoder_cli: "bg-emerald-500",
 }
 
 // ACP connection status (matches Rust ConnectionStatus)
@@ -1533,6 +1538,7 @@ export type McpAppType =
   | "open_code"
   | "cline"
   | "hermes"
+  | "qoder_cli"
 
 export interface LocalMcpServer {
   id: string

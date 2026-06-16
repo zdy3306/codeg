@@ -2795,6 +2795,7 @@ fn agent_local_config_path(agent_type: AgentType) -> Option<PathBuf> {
         AgentType::Gemini => Some(home_dir_or_default().join(".gemini").join("settings.json")),
         AgentType::OpenCode => Some(resolve_opencode_config_path()),
         AgentType::Cline => Some(cline_global_state_path()),
+        AgentType::QoderCli => Some(home_dir_or_default().join(".qoder").join("settings.json")),
         _ => None,
     }
 }
@@ -2973,6 +2974,11 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
         AgentType::Hermes => Some(SkillStorageSpec {
             kind: SkillStorageKind::SkillDirectoryOnly,
             global_dirs: vec![hermes_home_dir().join("skills")],
+            project_rel_dirs: vec![],
+        }),
+        AgentType::QoderCli => Some(SkillStorageSpec {
+            kind: SkillStorageKind::SkillDirectoryOnly,
+            global_dirs: vec![home_dir_or_default().join(".qoder").join("skills")],
             project_rel_dirs: vec![],
         }),
     }
@@ -3688,6 +3694,9 @@ fn cascade_update_agent_config(
             persist_agent_local_config_json(agent_type, Some(&patch_str))?;
         }
         AgentType::Cline => {}
+        AgentType::QoderCli => {
+            // QoderCli manages its own config; no-op for codeg.
+        }
     }
     Ok(())
 }
@@ -4622,6 +4631,12 @@ pub(crate) async fn acp_update_agent_preferences_core(
         return Ok(());
     }
 
+    if agent_type == AgentType::QoderCli {
+        // QoderCli manages its own config; no-op for codeg.
+        emit_acp_agents_updated(emitter, "preferences_updated", Some(agent_type));
+        return Ok(());
+    }
+
     let mut local_patch_value = config_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -4882,6 +4897,12 @@ pub(crate) async fn acp_update_agent_config_core(
         if let Some(raw) = config_json.as_deref() {
             persist_cline_local_config(Some(raw))?;
         }
+        emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
+        return Ok(());
+    }
+
+    if agent_type == AgentType::QoderCli {
+        // QoderCli manages its own config; no-op for codeg.
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
     }

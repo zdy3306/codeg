@@ -104,6 +104,7 @@ pub fn all_acp_agents() -> Vec<AgentType> {
         AgentType::OpenCode,
         AgentType::Cline,
         AgentType::Hermes,
+        AgentType::QoderCli,
     ]
 }
 
@@ -116,6 +117,7 @@ pub fn registry_id_for(agent_type: AgentType) -> &'static str {
         AgentType::OpenCode => "opencode",
         AgentType::Cline => "cline",
         AgentType::Hermes => "hermes",
+        AgentType::QoderCli => "qodercli",
     }
 }
 
@@ -128,6 +130,7 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
         "opencode" => Some(AgentType::OpenCode),
         "cline" => Some(AgentType::Cline),
         "hermes" => Some(AgentType::Hermes),
+        "qodercli" => Some(AgentType::QoderCli),
         _ => None,
     }
 }
@@ -283,6 +286,19 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 // Hermes supports.
                 python: Some("3.13"),
                 system_cmd: Some(("hermes", &["acp"])),
+            },
+        },
+        AgentType::QoderCli => AcpAgentMeta {
+            agent_type,
+            name: "Qoder CLI",
+            description: "Qoder CLI - AI coding assistant with ACP support",
+            distribution: AgentDistribution::Npx {
+                version: "1.0.21",
+                package: "@qoder-ai/qodercli@1.0.21",
+                cmd: "qodercli",
+                args: &["--acp"],
+                env: &[],
+                node_required: None,
             },
         },
     }

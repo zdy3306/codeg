@@ -895,7 +895,8 @@ fn build_new_session_request(
     if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
         req = req.meta(meta);
     }
-    if !mcp_servers.is_empty() {
+    // QoderCli requires mcpServers to always be present (even if empty).
+    if agent_type == AgentType::QoderCli || !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
     req
@@ -911,7 +912,8 @@ fn build_load_session_request(
     if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
         req = req.meta(meta);
     }
-    if !mcp_servers.is_empty() {
+    // QoderCli requires mcpServers to always be present (even if empty).
+    if agent_type == AgentType::QoderCli || !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
     req
@@ -1413,6 +1415,7 @@ async fn run_connection(
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
 
             // Advertise filesystem + terminal capabilities for ACP tool execution.
+            // Use LATEST for all agents — the actual version negotiation happens at the JSON-RPC level.
             let init_request = InitializeRequest::new(ProtocolVersion::LATEST).client_capabilities(
                 ClientCapabilities::new()
                     .terminal(true)
@@ -1431,8 +1434,7 @@ async fn run_connection(
             // outer `.map_err(...)` below. The outer layer attaches a
             // stable `code` to the frontend event so it can be localized.
             eprintln!(
-                "[ACP][{agent_name_for_log}] Sending Initialize (protocol={}, timeout=60s)",
-                ProtocolVersion::LATEST
+                "[ACP][{agent_name_for_log}] Sending Initialize (timeout=60s)"
             );
             let init_started = std::time::Instant::now();
             let init_resp = match tokio::time::timeout(
@@ -3033,14 +3035,49 @@ async fn run_conversation_loop<'a>(
                 // conflicting with session.read_update()'s mutable borrow.
                 let cx = session.connection();
                 let sid = session.session_id().clone();
-                let prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
                 // Use Box::pin (heap) instead of tokio::pin! (stack) so the
                 // future can be moved into a background task on cancel.
-                let mut prompt_response = Box::pin(
-                    cx.clone()
-                        .send_request_to(Agent, prompt_request)
-                        .block_task(),
-                );
+                let mut prompt_response: std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<serde_json::Value, sacp::Error>,
+                            > + Send,
+                    >,
+                > = if agent_type == AgentType::QoderCli {
+                    // QoderCli uses "prompt" field name instead of "blocks".
+                    let prompt_json = serde_json::to_value(&prompt_blocks).map_err(|e| {
+                        sacp::util::internal_error(format!(
+                            "Failed to serialize prompt blocks: {e}"
+                        ))
+                    })?;
+                    let params = serde_json::json!({
+                        "sessionId": sid.to_string(),
+                        "prompt": prompt_json
+                    });
+                    let req = UntypedMessage::new("session/prompt", params).map_err(|e| {
+                        sacp::util::internal_error(format!(
+                            "Failed to build QoderCli prompt request: {e}"
+                        ))
+                    })?;
+                    let cx2 = cx.clone();
+                    Box::pin(async move {
+                        cx2.send_request_to(Agent, req).block_task().await
+                    })
+                } else {
+                    let prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
+                    let cx2 = cx.clone();
+                    Box::pin(async move {
+                        let resp = cx2
+                            .send_request_to(Agent, prompt_request)
+                            .block_task()
+                            .await?;
+                        serde_json::to_value(resp).map_err(|e| {
+                            sacp::util::internal_error(format!(
+                                "Failed to serialize prompt response: {e}"
+                            ))
+                        })
+                    })
+                };
                 let mut tracked_terminal_tool_calls: HashMap<String, TrackedTerminalToolCall> =
                     HashMap::new();
                 let mut terminal_poll_interval = tokio::time::interval(
@@ -3183,7 +3220,14 @@ async fn run_conversation_loop<'a>(
                             }
                         }
                         prompt_result = &mut prompt_response => {
-                            let reason = prompt_result?.stop_reason;
+                            let raw_val = prompt_result?;
+                            let reason: StopReason = serde_json::from_value(
+                                raw_val.get("stopReason")
+                                    .or_else(|| raw_val.get("stop_reason"))
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null),
+                            )
+                            .unwrap_or(StopReason::EndTurn);
                             if !tracked_terminal_tool_calls.is_empty() {
                                 poll_tracked_terminal_tool_calls(
                                     terminal_runtime.as_ref(),
