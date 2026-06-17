@@ -69,6 +69,58 @@ impl QoderCliParser {
         let mut git_branch: Option<String> = None;
         let mut first_timestamp: Option<chrono::DateTime<Utc>> = None;
 
+        // Buffer for merging assistant entries that share the same message.id.
+        // QoderCli writes each content block (thinking, tool_use, text) as a
+        // separate JSONL entry for the same assistant message, so we must
+        // accumulate them and flush as one turn when the id changes.
+        let mut assistant_msg_id: Option<String> = None;
+        let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+        let mut assistant_timestamp: Option<chrono::DateTime<Utc>> = None;
+        let mut assistant_stop_reason: Option<String> = None;
+        let mut assistant_model: Option<String> = None;
+        let mut assistant_duration_ms: Option<u64> = None;
+
+        // Flush the accumulated assistant buffer as a single turn.
+        let flush_assistant = |turns: &mut Vec<MessageTurn>,
+                               assistant_msg_id: &mut Option<String>,
+                               assistant_blocks: &mut Vec<ContentBlock>,
+                               assistant_timestamp: &mut Option<chrono::DateTime<Utc>>,
+                               assistant_stop_reason: &mut Option<String>,
+                               assistant_model: &mut Option<String>,
+                               assistant_duration_ms: &mut Option<u64>| {
+            if assistant_blocks.is_empty() {
+                *assistant_msg_id = None;
+                return;
+            }
+            let blocks = std::mem::take(assistant_blocks);
+            let ts = assistant_timestamp.unwrap_or_else(Utc::now);
+            let completed_at = if assistant_stop_reason.is_some() {
+                Some(ts)
+            } else {
+                None
+            };
+            let dur = if assistant_stop_reason.as_deref() == Some("end_turn") {
+                *assistant_duration_ms
+            } else {
+                None
+            };
+            turns.push(MessageTurn {
+                id: format!("assistant-{}", turns.len()),
+                role: TurnRole::Assistant,
+                blocks,
+                timestamp: ts,
+                usage: None,
+                duration_ms: dur,
+                model: assistant_model.clone(),
+                completed_at,
+            });
+            *assistant_msg_id = None;
+            *assistant_timestamp = None;
+            *assistant_stop_reason = None;
+            *assistant_model = None;
+            *assistant_duration_ms = None;
+        };
+
         for line in reader.lines().map_while(Result::ok) {
             let line = line.trim();
             if line.is_empty() {
@@ -130,6 +182,16 @@ impl QoderCliParser {
                                             .map(|s| s.to_string());
                                     }
                                     let timestamp = parse_timestamp(&val);
+                                    // Flush pending assistant buffer before user content
+                                    flush_assistant(
+                                        &mut turns,
+                                        &mut assistant_msg_id,
+                                        &mut assistant_blocks,
+                                        &mut assistant_timestamp,
+                                        &mut assistant_stop_reason,
+                                        &mut assistant_model,
+                                        &mut assistant_duration_ms,
+                                    );
                                     if !current_user_content.is_empty() {
                                         turns.push(MessageTurn {
                                             id: format!("user-{}", turns.len()),
@@ -210,11 +272,19 @@ impl QoderCliParser {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
                         }
-                        let content_blocks = message.get("content");
-                        if let Some(serde_json::Value::Array(blocks)) = content_blocks {
-                            let timestamp = parse_timestamp(&val);
 
-                            // Flush previous user content
+                        let msg_id = message
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+
+                        // Check if this is a different assistant message than the buffered one.
+                        // If so, flush the previous buffer as a complete turn.
+                        if assistant_msg_id.is_some()
+                            && assistant_msg_id.as_deref() != msg_id.as_deref()
+                        {
+                            // Flush accumulated user content first
+                            let timestamp = parse_timestamp(&val);
                             if !current_user_content.is_empty() {
                                 turns.push(MessageTurn {
                                     id: format!("user-{}", turns.len()),
@@ -227,8 +297,38 @@ impl QoderCliParser {
                                     completed_at: None,
                                 });
                             }
+                            flush_assistant(
+                                &mut turns,
+                                &mut assistant_msg_id,
+                                &mut assistant_blocks,
+                                &mut assistant_timestamp,
+                                &mut assistant_stop_reason,
+                                &mut assistant_model,
+                                &mut assistant_duration_ms,
+                            );
+                        }
 
-                            let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
+                        // Set or update the assistant message buffer
+                        if assistant_msg_id.is_none() {
+                            // New assistant message — flush any pending user content
+                            let timestamp = parse_timestamp(&val);
+                            if !current_user_content.is_empty() {
+                                turns.push(MessageTurn {
+                                    id: format!("user-{}", turns.len()),
+                                    role: TurnRole::User,
+                                    blocks: std::mem::take(&mut current_user_content),
+                                    timestamp,
+                                    usage: None,
+                                    duration_ms: None,
+                                    model: None,
+                                    completed_at: None,
+                                });
+                            }
+                            assistant_msg_id = msg_id.clone();
+                        }
+
+                        // Accumulate content blocks from this entry
+                        if let Some(serde_json::Value::Array(blocks)) = message.get("content") {
                             for block in blocks {
                                 if let Some(block_type) =
                                     block.get("type").and_then(|v| v.as_str())
@@ -279,43 +379,38 @@ impl QoderCliParser {
                                     }
                                 }
                             }
-
-                            if !assistant_blocks.is_empty() {
-                                let stop_reason = message.get("stop_reason").and_then(|v| v.as_str());
-                                let model_str = message
-                                    .get("model")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
-                                let duration =
-                                    if stop_reason == Some("end_turn") {
-                                        val.get("duration_ms").and_then(|v| v.as_u64())
-                                    } else {
-                                        None
-                                    };
-                                let completed_at =
-                                    if stop_reason.is_some() {
-                                        Some(timestamp)
-                                    } else {
-                                        None
-                                    };
-
-                                turns.push(MessageTurn {
-                                    id: format!("assistant-{}", turns.len()),
-                                    role: TurnRole::Assistant,
-                                    blocks: assistant_blocks,
-                                    timestamp,
-                                    usage: None,
-                                    duration_ms: duration,
-                                    model: model_str,
-                                    completed_at,
-                                });
-                            }
                         }
+
+                        // Update metadata from the latest entry (later entries have stop_reason)
+                        if let Some(sr) = message.get("stop_reason").and_then(|v| v.as_str()) {
+                            assistant_stop_reason = Some(sr.to_string());
+                        }
+                        if let Some(m) = message.get("model").and_then(|v| v.as_str()) {
+                            assistant_model = Some(m.to_string());
+                        }
+                        if assistant_stop_reason.as_deref() == Some("end_turn") {
+                            assistant_duration_ms = val
+                                .get("duration_ms")
+                                .and_then(|v| v.as_u64());
+                        }
+                        // Always update timestamp to the latest entry
+                        assistant_timestamp = Some(parse_timestamp(&val));
                     }
                 }
                 _ => {}
             }
         }
+
+        // Flush remaining assistant buffer
+        flush_assistant(
+            &mut turns,
+            &mut assistant_msg_id,
+            &mut assistant_blocks,
+            &mut assistant_timestamp,
+            &mut assistant_stop_reason,
+            &mut assistant_model,
+            &mut assistant_duration_ms,
+        );
 
         // Flush remaining user content
         if !current_user_content.is_empty() {
@@ -488,6 +583,88 @@ mod tests {
         assert_eq!(turns[1].role, TurnRole::Assistant);
         // Assistant turn should have thinking + text blocks
         assert_eq!(turns[1].blocks.len(), 2);
+    }
+
+    #[test]
+    fn merge_assistant_entries_with_same_message_id() {
+        // QoderCli writes each content block as a separate JSONL entry for the
+        // same assistant message (same message.id). These must be merged into
+        // a single turn, not split into multiple turns.
+        let f = make_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"hi"},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":null,"content":[{"type":"thinking","thinking":"thinking..."}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"hello!"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        // Should be 2 turns: user + assistant (merged), NOT 3 turns
+        assert_eq!(turns.len(), 2, "assistant entries with same message.id must merge into one turn");
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        // The merged assistant turn should have both thinking + text blocks
+        assert_eq!(turns[1].blocks.len(), 2, "merged turn should have thinking + text blocks");
+        assert!(matches!(turns[1].blocks[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(turns[1].blocks[1], ContentBlock::Text { .. }));
+        // Should have completed_at from the last entry (stop_reason: end_turn)
+        assert!(turns[1].completed_at.is_some(), "merged turn should have completed_at");
+    }
+
+    #[test]
+    fn separate_assistant_entries_with_different_ids() {
+        // Assistant entries with different message.id should create separate turns.
+        let f = make_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"hi"},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"reply 1"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m2","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"reply 2"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        // Should be 3 turns: user + assistant(m1) + assistant(m2)
+        assert_eq!(turns.len(), 3, "different message.id should create separate turns");
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        assert_eq!(turns[2].role, TurnRole::Assistant);
+    }
+
+    #[test]
+    fn thinking_only_entry_buffers_until_text_arrives() {
+        // A thinking-only entry (stop_reason: null) should be buffered,
+        // and the text entry (stop_reason: end_turn) completes the turn.
+        let f = make_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"ping"},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":null,"content":[{"type":"thinking","thinking":"hmm"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"pong"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"ping2"},"cwd":"C:\\proj","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        // user(1) + merged assistant(m1) + user(2) = 3 turns
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        assert_eq!(turns[2].role, TurnRole::User);
+        assert_eq!(turns[1].blocks.len(), 2, "merged thinking + text");
+    }
+
+    #[test]
+    fn tool_use_entry_merges_with_thinking() {
+        // tool_use entry with same message.id as thinking entry should merge.
+        let f = make_jsonl(&[
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"write file"},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":null,"content":[{"type":"thinking","thinking":"need to write"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"path":"/tmp/x"}}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        // user(1) + merged assistant(thinking+tool_use) + user(tool_result) = 3 turns
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        assert_eq!(turns[1].blocks.len(), 2, "merged thinking + tool_use");
+        assert!(matches!(turns[1].blocks[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(turns[1].blocks[1], ContentBlock::ToolUse { .. }));
+        assert_eq!(turns[2].role, TurnRole::User);
     }
 
     #[test]
