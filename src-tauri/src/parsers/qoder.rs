@@ -222,48 +222,100 @@ impl QoderCliParser {
                                             .map(|s| s.to_string());
                                     }
                                     let timestamp = parse_timestamp(&val);
-                                    // Flush pending assistant buffer and any
-                                    // accumulated user content before processing
-                                    // this array (once per JSONL line, not per block).
-                                    flush_assistant(
-                                        &mut turns,
-                                        &mut assistant_msg_id,
-                                        &mut assistant_blocks,
-                                        &mut assistant_timestamp,
-                                        &mut assistant_stop_reason,
-                                        &mut assistant_model,
-                                        &mut assistant_duration_ms,
-                                    );
-                                    if !current_user_content.is_empty() {
-                                        turns.push(MessageTurn {
-                                            id: format!("user-{}", turns.len()),
-                                            role: TurnRole::User,
-                                            blocks: std::mem::take(&mut current_user_content),
-                                            timestamp,
-                                            usage: None,
-                                            duration_ms: None,
-                                            model: None,
-                                            completed_at: None,
+
+                                    // Check if ALL blocks are tool_result type.
+                                    // When a user entry contains only tool_results
+                                    // (the MCP tool result payload for a preceding
+                                    // tool_use), merge them into the last assistant
+                                    // turn so the adapter can match tool_use ↔
+                                    // tool_result within the same turn.
+                                    let all_tool_results = !blocks.is_empty()
+                                        && blocks.iter().all(|b| {
+                                            b.get("type")
+                                                .and_then(|v| v.as_str())
+                                                == Some("tool_result")
                                         });
-                                    }
-                                    for block in blocks {
-                                        let block_type = block
-                                            .get("type")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("");
-                                        match block_type {
-                                            "text" => {
-                                                if let Some(text) =
-                                                    block.get("text").and_then(|v| v.as_str())
-                                                {
-                                                    current_user_content.push(
-                                                        ContentBlock::Text {
-                                                            text: text.to_string(),
-                                                        },
-                                                    );
-                                                }
+
+                                    if all_tool_results {
+                                        // Extract tool_result blocks and attach them
+                                        // to the most recent assistant turn in `turns`.
+                                        // Flush any pending assistant buffer first so
+                                        // the target turn is already in `turns`.
+                                        flush_assistant(
+                                            &mut turns,
+                                            &mut assistant_msg_id,
+                                            &mut assistant_blocks,
+                                            &mut assistant_timestamp,
+                                            &mut assistant_stop_reason,
+                                            &mut assistant_model,
+                                            &mut assistant_duration_ms,
+                                        );
+                                        // Find the last assistant turn and append the
+                                        // tool_result blocks to it.
+                                        if let Some(last_turn) =
+                                            turns.iter_mut().rev().find(|t| {
+                                                matches!(t.role, TurnRole::Assistant)
+                                            })
+                                        {
+                                            for block in blocks {
+                                                let tool_use_id = block
+                                                    .get("tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                let output = block
+                                                    .get("content")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                let is_error = block
+                                                    .get("is_error")
+                                                    .and_then(|v| v.as_bool())
+                                                    .unwrap_or(false);
+                                                last_turn.blocks.push(
+                                                    ContentBlock::ToolResult {
+                                                        tool_use_id: Some(
+                                                            tool_use_id,
+                                                        ),
+                                                        output_preview: Some(
+                                                            output,
+                                                        ),
+                                                        is_error,
+                                                        agent_stats: None,
+                                                    },
+                                                );
                                             }
-                                            "tool_result" => {
+                                        } else {
+                                            // No assistant turn to merge into —
+                                            // fall back to creating a normal user turn.
+                                            flush_assistant(
+                                                &mut turns,
+                                                &mut assistant_msg_id,
+                                                &mut assistant_blocks,
+                                                &mut assistant_timestamp,
+                                                &mut assistant_stop_reason,
+                                                &mut assistant_model,
+                                                &mut assistant_duration_ms,
+                                            );
+                                            if !current_user_content.is_empty()
+                                            {
+                                                turns.push(MessageTurn {
+                                                    id: format!(
+                                                        "user-{}",
+                                                        turns.len()
+                                                    ),
+                                                    role: TurnRole::User,
+                                                    blocks: std::mem::take(
+                                                        &mut current_user_content,
+                                                    ),
+                                                    timestamp,
+                                                    usage: None,
+                                                    duration_ms: None,
+                                                    model: None,
+                                                    completed_at: None,
+                                                });
+                                            }
+                                            for block in blocks {
                                                 let tool_use_id = block
                                                     .get("tool_use_id")
                                                     .and_then(|v| v.as_str())
@@ -280,14 +332,97 @@ impl QoderCliParser {
                                                     .unwrap_or(false);
                                                 current_user_content.push(
                                                     ContentBlock::ToolResult {
-                                                        tool_use_id: Some(tool_use_id),
-                                                        output_preview: Some(output),
+                                                        tool_use_id: Some(
+                                                            tool_use_id,
+                                                        ),
+                                                        output_preview: Some(
+                                                            output,
+                                                        ),
                                                         is_error,
                                                         agent_stats: None,
                                                     },
                                                 );
                                             }
-                                            _ => {}
+                                        }
+                                    } else {
+                                        // Mixed content (text + tool_result, or
+                                        // just text) — existing logic: flush and
+                                        // create a normal user turn.
+                                        flush_assistant(
+                                            &mut turns,
+                                            &mut assistant_msg_id,
+                                            &mut assistant_blocks,
+                                            &mut assistant_timestamp,
+                                            &mut assistant_stop_reason,
+                                            &mut assistant_model,
+                                            &mut assistant_duration_ms,
+                                        );
+                                        if !current_user_content.is_empty() {
+                                            turns.push(MessageTurn {
+                                                id: format!(
+                                                    "user-{}",
+                                                    turns.len()
+                                                ),
+                                                role: TurnRole::User,
+                                                blocks: std::mem::take(
+                                                    &mut current_user_content,
+                                                ),
+                                                timestamp,
+                                                usage: None,
+                                                duration_ms: None,
+                                                model: None,
+                                                completed_at: None,
+                                            });
+                                        }
+                                        for block in blocks {
+                                            let block_type = block
+                                                .get("type")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            match block_type {
+                                                "text" => {
+                                                    if let Some(text) = block
+                                                        .get("text")
+                                                        .and_then(|v| v.as_str())
+                                                    {
+                                                        current_user_content.push(
+                                                            ContentBlock::Text {
+                                                                text: text
+                                                                    .to_string(),
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                                "tool_result" => {
+                                                    let tool_use_id = block
+                                                        .get("tool_use_id")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    let output = block
+                                                        .get("content")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    let is_error = block
+                                                        .get("is_error")
+                                                        .and_then(|v| v.as_bool())
+                                                        .unwrap_or(false);
+                                                    current_user_content.push(
+                                                        ContentBlock::ToolResult {
+                                                            tool_use_id: Some(
+                                                                tool_use_id,
+                                                            ),
+                                                            output_preview: Some(
+                                                                output,
+                                                            ),
+                                                            is_error,
+                                                            agent_stats: None,
+                                                        },
+                                                    );
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
                                 }
@@ -708,14 +843,15 @@ mod tests {
         ]);
         let parser = QoderCliParser::new();
         let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
-        // user(1) + merged assistant(thinking+tool_use) + user(tool_result) = 3 turns
-        assert_eq!(turns.len(), 3);
+        // user(1) + merged assistant(thinking+tool_use+tool_result) = 2 turns
+        // tool_result-only user turns merge into the previous assistant turn
+        assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, TurnRole::User);
         assert_eq!(turns[1].role, TurnRole::Assistant);
-        assert_eq!(turns[1].blocks.len(), 2, "merged thinking + tool_use");
+        assert_eq!(turns[1].blocks.len(), 3, "merged thinking + tool_use + tool_result");
         assert!(matches!(turns[1].blocks[0], ContentBlock::Thinking { .. }));
         assert!(matches!(turns[1].blocks[1], ContentBlock::ToolUse { .. }));
-        assert_eq!(turns[2].role, TurnRole::User);
+        assert!(matches!(turns[1].blocks[2], ContentBlock::ToolResult { .. }));
     }
 
     #[test]
@@ -762,5 +898,38 @@ mod tests {
         let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].blocks.len(), 2, "must capture both text blocks from array");
+    }
+
+    #[test]
+    fn tool_result_only_user_turn_merges_into_assistant() {
+        // QoderCli stores tool_result for ask_user_question in a user turn.
+        // The tool_result-only user turn should merge into the previous
+        // assistant turn so the adapter can match tool_use ↔ tool_result.
+        let f = make_jsonl(&[
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-06-16T15:14:27Z","message":{"role":"user","content":[{"type":"text","text":"ask a question"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-06-16T15:14:32Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":null,"content":[{"type":"thinking","thinking":"hmm"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+            r#"{"type":"assistant","uuid":"a2","timestamp":"2026-06-16T15:14:32Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"tool_use","content":[{"type":"tool_use","id":"call_abc","name":"mcp__codeg-mcp__ask_user_question","input":{"questions":[{"header":"Fruit","multiSelect":false,"options":[{"label":"Apple","description":""},{"label":"Banana","description":""}],"question":"What fruit?"}]}}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+            r#"{"type":"user","uuid":"u2","timestamp":"2026-06-16T15:15:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_abc","content":"The user answered your question(s):\n1. [Fruit] What fruit?\n   → Apple\n","is_error":false}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+            r#"{"type":"assistant","uuid":"a3","timestamp":"2026-06-16T15:15:03Z","message":{"id":"m2","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"You chose Apple!"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        // user(1) + assistant(m1 with tool_result merged) + assistant(m2) = 3 turns
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        assert_eq!(turns[2].role, TurnRole::Assistant);
+        // The first assistant turn should have thinking + tool_use + tool_result
+        assert_eq!(turns[1].blocks.len(), 3, "thinking + tool_use + tool_result");
+        assert!(matches!(turns[1].blocks[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(turns[1].blocks[1], ContentBlock::ToolUse { .. }));
+        assert!(matches!(turns[1].blocks[2], ContentBlock::ToolResult { .. }));
+        // Verify the tool_result output is correct
+        if let ContentBlock::ToolResult { tool_use_id, output_preview, .. } = &turns[1].blocks[2] {
+            assert_eq!(tool_use_id.as_deref(), Some("call_abc"));
+            assert!(output_preview.as_deref().unwrap().contains("Apple"));
+        } else {
+            panic!("expected ToolResult block");
+        }
     }
 }
