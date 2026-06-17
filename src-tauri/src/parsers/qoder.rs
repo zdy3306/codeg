@@ -209,34 +209,85 @@ impl QoderCliParser {
                                     });
                                 }
                                 Some(serde_json::Value::Array(blocks)) => {
+                                    if cwd.is_none() {
+                                        cwd = val
+                                            .get("cwd")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                    }
+                                    if git_branch.is_none() {
+                                        git_branch = val
+                                            .get("gitBranch")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+                                    }
+                                    let timestamp = parse_timestamp(&val);
+                                    // Flush pending assistant buffer and any
+                                    // accumulated user content before processing
+                                    // this array (once per JSONL line, not per block).
+                                    flush_assistant(
+                                        &mut turns,
+                                        &mut assistant_msg_id,
+                                        &mut assistant_blocks,
+                                        &mut assistant_timestamp,
+                                        &mut assistant_stop_reason,
+                                        &mut assistant_model,
+                                        &mut assistant_duration_ms,
+                                    );
+                                    if !current_user_content.is_empty() {
+                                        turns.push(MessageTurn {
+                                            id: format!("user-{}", turns.len()),
+                                            role: TurnRole::User,
+                                            blocks: std::mem::take(&mut current_user_content),
+                                            timestamp,
+                                            usage: None,
+                                            duration_ms: None,
+                                            model: None,
+                                            completed_at: None,
+                                        });
+                                    }
                                     for block in blocks {
-                                        if block
+                                        let block_type = block
                                             .get("type")
                                             .and_then(|v| v.as_str())
-                                            == Some("tool_result")
-                                        {
-                                            let tool_use_id = block
-                                                .get("tool_use_id")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let output = block
-                                                .get("content")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            let is_error = block
-                                                .get("is_error")
-                                                .and_then(|v| v.as_bool())
-                                                .unwrap_or(false);
-                                            current_user_content.push(
-                                                ContentBlock::ToolResult {
-                                                    tool_use_id: Some(tool_use_id),
-                                                    output_preview: Some(output),
-                                                    is_error,
-                                                    agent_stats: None,
-                                                },
-                                            );
+                                            .unwrap_or("");
+                                        match block_type {
+                                            "text" => {
+                                                if let Some(text) =
+                                                    block.get("text").and_then(|v| v.as_str())
+                                                {
+                                                    current_user_content.push(
+                                                        ContentBlock::Text {
+                                                            text: text.to_string(),
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                            "tool_result" => {
+                                                let tool_use_id = block
+                                                    .get("tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                let output = block
+                                                    .get("content")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                let is_error = block
+                                                    .get("is_error")
+                                                    .and_then(|v| v.as_bool())
+                                                    .unwrap_or(false);
+                                                current_user_content.push(
+                                                    ContentBlock::ToolResult {
+                                                        tool_use_id: Some(tool_use_id),
+                                                        output_preview: Some(output),
+                                                        is_error,
+                                                        agent_stats: None,
+                                                    },
+                                                );
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -681,5 +732,35 @@ mod tests {
         ]);
         let parser = QoderCliParser::new();
         assert!(parser.parse_jsonl_file(f.path()).is_none());
+    }
+
+    #[test]
+    fn parse_user_content_as_array_of_text_blocks() {
+        let f = make_jsonl(&[
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-06-17T13:20:54.451Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-06-17T13:20:58.413Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"hi there"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        assert_eq!(turns.len(), 2, "must parse user turn from array-format content");
+        assert_eq!(turns[0].role, TurnRole::User);
+        assert_eq!(turns[1].role, TurnRole::Assistant);
+        // Verify the user text block was captured
+        match &turns[0].blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "hello"),
+            other => panic!("expected Text block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_user_content_array_with_multiple_blocks() {
+        let f = make_jsonl(&[
+            r#"{"type":"user","uuid":"u1","timestamp":"2026-06-17T13:20:54.451Z","message":{"role":"user","content":[{"type":"text","text":"ping"},{"type":"text","text":"pong"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+            r#"{"type":"assistant","uuid":"a1","timestamp":"2026-06-17T13:20:58.413Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"response"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
+        ]);
+        let parser = QoderCliParser::new();
+        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].blocks.len(), 2, "must capture both text blocks from array");
     }
 }
