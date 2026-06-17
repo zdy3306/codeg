@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "Retour à la ligne",
         "description": "Insérer un retour à la ligne dans la zone de saisie"
+      },
+      "toggle_tile_mode": {
+        "title": "Basculer le mode mosaïque",
+        "description": "Basculer entre l'affichage mosaïque et normal"
       }
     }
   },

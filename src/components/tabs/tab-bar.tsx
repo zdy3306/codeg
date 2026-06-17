@@ -75,6 +75,12 @@ export function TabBar() {
         return
       }
 
+      if (matchShortcutEvent(event, shortcuts.toggle_tile_mode)) {
+        event.preventDefault()
+        toggleTileMode()
+        return
+      }
+
       if (!matchShortcutEvent(event, shortcuts.close_current_tab)) return
       if (!activeTabId) return
 
@@ -95,8 +101,10 @@ export function TabBar() {
     shortcuts.close_current_tab,
     shortcuts.next_tab,
     shortcuts.prev_tab,
+    shortcuts.toggle_tile_mode,
     switchTab,
     tabs,
+    toggleTileMode,
   ])
 
   const handleReorder = useCallback(

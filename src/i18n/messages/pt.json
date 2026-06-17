@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "Nova linha na mensagem",
         "description": "Inserir uma nova linha na caixa de entrada"
+      },
+      "toggle_tile_mode": {
+        "title": "Alternar modo mosaico",
+        "description": "Alternar entre exibição de mosaico e normal"
       }
     }
   },

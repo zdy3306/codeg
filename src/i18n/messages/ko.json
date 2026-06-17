@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "메시지 줄바꿈",
         "description": "입력창에 줄바꿈을 삽입"
+      },
+      "toggle_tile_mode": {
+        "title": "타일 모드 전환",
+        "description": "타일 표시와 일반 탭 표시 전환"
       }
     }
   },

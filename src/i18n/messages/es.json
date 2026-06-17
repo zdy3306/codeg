@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "Nueva línea en mensaje",
         "description": "Insertar una nueva línea en el cuadro de entrada"
+      },
+      "toggle_tile_mode": {
+        "title": "Alternar modo mosaico",
+        "description": "Cambiar entre vista de mosaico y normal"
       }
     }
   },

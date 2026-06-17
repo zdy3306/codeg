@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "消息换行",
         "description": "在输入框中插入换行符"
+      },
+      "toggle_tile_mode": {
+        "title": "切换平铺模式",
+        "description": "在平铺和普通标签显示之间切换"
       }
     }
   },

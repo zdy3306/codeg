@@ -14,6 +14,7 @@ export type ShortcutActionId =
   | "prev_tab"
   | "send_message"
   | "newline_in_message"
+  | "toggle_tile_mode"
 
 export interface ShortcutDefinition {
   id: ShortcutActionId
@@ -65,6 +66,9 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   {
     id: "newline_in_message",
   },
+  {
+    id: "toggle_tile_mode",
+  },
 ]
 
 /** Actions that allow shortcuts without modifier keys (e.g. plain Enter). */
@@ -91,6 +95,7 @@ export const DEFAULT_SHORTCUTS: ShortcutSettings = {
   prev_tab: "mod+shift+tab",
   send_message: "enter",
   newline_in_message: "shift+enter",
+  toggle_tile_mode: "mod+shift+t",
 }
 
 export const SHORTCUTS_STORAGE_KEY = "settings:shortcuts:v1"

@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "訊息換行",
         "description": "在輸入框中插入換行符"
+      },
+      "toggle_tile_mode": {
+        "title": "切換平鋪模式",
+        "description": "在平鋪和普通標籤顯示之間切換"
       }
     }
   },

@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "メッセージ内で改行",
         "description": "入力欄で改行を挿入する"
+      },
+      "toggle_tile_mode": {
+        "title": "タイルモード切替",
+        "description": "タイル表示と通常表示を切り替える"
       }
     }
   },

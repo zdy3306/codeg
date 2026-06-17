@@ -293,8 +293,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Qoder CLI",
             description: "Qoder CLI - AI coding assistant with ACP support",
             distribution: AgentDistribution::Npx {
-                version: "1.0.21",
-                package: "@qoder-ai/qodercli@1.0.21",
+                version: "1.0.23",
+                package: "@qoder-ai/qodercli@1.0.23",
                 cmd: "qodercli",
                 args: &["--acp"],
                 env: &[],

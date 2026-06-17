@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "Zeilenumbruch einfügen",
         "description": "Einen Zeilenumbruch im Eingabefeld einfügen"
+      },
+      "toggle_tile_mode": {
+        "title": "Kachelmodus umschalten",
+        "description": "Zwischen Kachel- und normaler Tab-Ansicht wechseln"
       }
     }
   },

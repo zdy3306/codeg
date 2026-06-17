@@ -315,6 +315,10 @@
       "newline_in_message": {
         "title": "Newline in Message",
         "description": "Insert a newline in the message input box"
+      },
+      "toggle_tile_mode": {
+        "title": "Toggle Tile Mode",
+        "description": "Switch between tiled and normal tab display"
       }
     }
   },
