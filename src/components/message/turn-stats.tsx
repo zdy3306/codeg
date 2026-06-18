@@ -93,7 +93,6 @@ export function TurnStats({
   const hasCompletedAt = Boolean(completedLabel)
   const hasJump =
     isResponseComplete &&
-    hasUsage &&
     typeof previousUserIndex === "number" &&
     Boolean(scroll?.scrollToIndex)
 
