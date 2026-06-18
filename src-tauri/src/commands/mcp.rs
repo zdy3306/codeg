@@ -2116,10 +2116,7 @@ fn upsert_server_for_app(app: McpAppType, id: &str, spec: &Value) -> Result<(), 
         McpAppType::OpenClaw => upsert_openclaw_server(id, spec),
         McpAppType::Cline => upsert_cline_server(id, spec),
         McpAppType::Hermes => upsert_hermes_server(id, spec),
-        McpAppType::QoderCli => {
-            // QoderCli MCP servers are managed by qodercli itself; codeg is read-only.
-            Ok(())
-        }
+        McpAppType::QoderCli => upsert_qodercli_server(id, spec),
     }
 }
 
@@ -2416,6 +2413,69 @@ fn read_qodercli_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
     Ok(out)
 }
 
+fn upsert_qodercli_server(id: &str, spec: &Value) -> Result<(), AppCommandError> {
+    let path = dirs::home_dir()
+        .ok_or_else(|| mcp_configuration_invalid("cannot determine home directory"))?
+        .join(".qoder")
+        .join("settings.json");
+    let mut root = read_json_file(&path)?;
+    if !root.is_object() {
+        root = json!({});
+    }
+
+    let obj = root.as_object_mut().ok_or_else(|| {
+        mcp_configuration_invalid(format!("invalid JSON root in {}", path.display()))
+    })?;
+    if !obj.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+        obj.insert("mcpServers".to_string(), Value::Object(Map::new()));
+    }
+
+    let canonical = canonicalize_spec(spec, "QoderCli write")?;
+
+    let map = obj
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            mcp_configuration_invalid(format!("invalid mcpServers in {}", path.display()))
+        })?;
+    map.insert(id.to_string(), canonical);
+
+    write_json_file(&path, &root)
+}
+
+fn remove_qodercli_server(id: &str) -> Result<bool, AppCommandError> {
+    let path = dirs::home_dir()
+        .ok_or_else(|| mcp_configuration_invalid("cannot determine home directory"))?
+        .join(".qoder")
+        .join("settings.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut root = read_json_file(&path)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let removed = if let Some(servers) = obj.get_mut("mcpServers").and_then(Value::as_object_mut)
+    {
+        servers.remove(id).is_some()
+    } else {
+        false
+    };
+
+    if removed {
+        if let Some(servers) = obj.get("mcpServers").and_then(Value::as_object) {
+            if servers.is_empty() {
+                obj.remove("mcpServers");
+            }
+        }
+        write_json_file(&path, &root)?;
+    }
+
+    Ok(removed)
+}
+
 fn remove_server_for_app(app: McpAppType, id: &str) -> Result<bool, AppCommandError> {
     match app {
         McpAppType::ClaudeCode => remove_claude_server(id),
@@ -2425,10 +2485,7 @@ fn remove_server_for_app(app: McpAppType, id: &str) -> Result<bool, AppCommandEr
         McpAppType::OpenClaw => remove_openclaw_server(id),
         McpAppType::Cline => remove_cline_server(id),
         McpAppType::Hermes => remove_hermes_server(id),
-        McpAppType::QoderCli => {
-            // QoderCli MCP servers are managed by qodercli itself; codeg is read-only.
-            Ok(false)
-        }
+        McpAppType::QoderCli => remove_qodercli_server(id),
     }
 }
 
