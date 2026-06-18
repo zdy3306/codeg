@@ -57,7 +57,7 @@ impl QoderCliParser {
     fn parse_jsonl_file(
         &self,
         path: &std::path::Path,
-    ) -> Option<(ConversationSummary, Vec<MessageTurn>)> {
+    ) -> Option<(ConversationSummary, Vec<MessageTurn>, Option<u64>)> {
         let file = fs::File::open(path).ok()?;
         let reader = BufReader::new(file);
 
@@ -68,6 +68,7 @@ impl QoderCliParser {
         let mut cwd: Option<String> = None;
         let mut git_branch: Option<String> = None;
         let mut first_timestamp: Option<chrono::DateTime<Utc>> = None;
+        let mut context_window_max_tokens: Option<u64> = None;
 
         // Buffer for merging assistant entries that share the same message.id.
         // QoderCli writes each content block (thinking, tool_use, text) as a
@@ -142,6 +143,11 @@ impl QoderCliParser {
                         .get("model")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+                    if let Some(cw) = val.get("contextWindow").and_then(|v| v.as_u64()) {
+                        if cw > 0 {
+                            context_window_max_tokens = Some(cw);
+                        }
+                    }
                     if first_timestamp.is_none() {
                         first_timestamp = Some(parse_timestamp(&val));
                     }
@@ -649,7 +655,7 @@ impl QoderCliParser {
             delegation_call_id: None,
         };
 
-        Some((summary, turns))
+        Some((summary, turns, context_window_max_tokens))
     }
 }
 
@@ -659,7 +665,7 @@ impl AgentParser for QoderCliParser {
         let mut summaries = Vec::new();
 
         for path in &files {
-            if let Some((summary, _turns)) = self.parse_jsonl_file(path) {
+            if let Some((summary, _turns, _ctx_max)) = self.parse_jsonl_file(path) {
                 summaries.push(summary);
             }
         }
@@ -675,12 +681,25 @@ impl AgentParser for QoderCliParser {
         let files = self.list_jsonl_files();
 
         for path in &files {
-            if let Some((summary, turns)) = self.parse_jsonl_file(path) {
+            if let Some((summary, turns, ctx_max)) = self.parse_jsonl_file(path) {
                 if summary.id == conversation_id {
+                    let mut stats = super::compute_session_stats(&turns);
+                    if let Some(ref mut s) = stats {
+                        s.context_window_max_tokens = ctx_max.or(s.context_window_max_tokens);
+                        if let (Some(used), Some(max)) =
+                            (s.total_tokens, s.context_window_max_tokens)
+                        {
+                            s.context_window_used_tokens = Some(used);
+                            if max > 0 {
+                                s.context_window_usage_percent =
+                                    Some((used as f64 / max as f64) * 100.0);
+                            }
+                        }
+                    }
                     return Ok(ConversationDetail {
                         summary,
                         turns,
-                        session_stats: None,
+                        session_stats: stats,
                     });
                 }
             }
@@ -730,7 +749,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","model":"qmodel_latest","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}]},"cwd":"D:\\test","sessionId":"sid-123"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (summary, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (summary, turns, _ctx_max) = parser.parse_jsonl_file(f.path()).unwrap();
         assert_eq!(summary.id, "sid-123");
         assert_eq!(summary.model.as_deref(), Some("qmodel_latest"));
         assert_eq!(summary.folder_path.as_deref(), Some("D:\\test"));
@@ -749,7 +768,7 @@ mod tests {
         let parser = QoderCliParser::new();
         let result = parser.parse_jsonl_file(f.path());
         assert!(result.is_some(), "parser must not return None when runtime-config is absent");
-        let (summary, turns) = result.unwrap();
+        let (summary, turns, _) = result.unwrap();
         assert_eq!(summary.id, "b49bc65b");
         assert_eq!(summary.folder_path.as_deref(), Some("D:\\xiaogou\\codeg"));
         assert_eq!(summary.git_branch.as_deref(), Some("main"));
@@ -763,7 +782,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"id":"a1","type":"message","role":"assistant","model":"m","stop_reason":"end_turn","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"pong"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, TurnRole::User);
         assert_eq!(turns[1].role, TurnRole::Assistant);
@@ -782,7 +801,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"hello!"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         // Should be 2 turns: user + assistant (merged), NOT 3 turns
         assert_eq!(turns.len(), 2, "assistant entries with same message.id must merge into one turn");
         assert_eq!(turns[0].role, TurnRole::User);
@@ -804,7 +823,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-01-01T00:00:03Z","message":{"id":"m2","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"reply 2"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         // Should be 3 turns: user + assistant(m1) + assistant(m2)
         assert_eq!(turns.len(), 3, "different message.id should create separate turns");
         assert_eq!(turns[0].role, TurnRole::User);
@@ -823,7 +842,7 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"ping2"},"cwd":"C:\\proj","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         // user(1) + merged assistant(m1) + user(2) = 3 turns
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].role, TurnRole::User);
@@ -842,7 +861,7 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]},"cwd":"C:\\proj","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         // user(1) + merged assistant(thinking+tool_use+tool_result) = 2 turns
         // tool_result-only user turns merge into the previous assistant turn
         assert_eq!(turns.len(), 2);
@@ -877,7 +896,7 @@ mod tests {
             r#"{"type":"assistant","uuid":"a1","timestamp":"2026-06-17T13:20:58.413Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"hi there"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         assert_eq!(turns.len(), 2, "must parse user turn from array-format content");
         assert_eq!(turns[0].role, TurnRole::User);
         assert_eq!(turns[1].role, TurnRole::Assistant);
@@ -895,7 +914,7 @@ mod tests {
             r#"{"type":"assistant","uuid":"a1","timestamp":"2026-06-17T13:20:58.413Z","message":{"id":"m1","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"response"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].blocks.len(), 2, "must capture both text blocks from array");
     }
@@ -913,7 +932,7 @@ mod tests {
             r#"{"type":"assistant","uuid":"a3","timestamp":"2026-06-16T15:15:03Z","message":{"id":"m2","type":"message","role":"assistant","model":"qmodel","stop_reason":"end_turn","content":[{"type":"text","text":"You chose Apple!"}]},"cwd":"D:\\test","sessionId":"s1"}"#,
         ]);
         let parser = QoderCliParser::new();
-        let (_, turns) = parser.parse_jsonl_file(f.path()).unwrap();
+        let (_, turns, _) = parser.parse_jsonl_file(f.path()).unwrap();
         // user(1) + assistant(m1 with tool_result merged) + assistant(m2) = 3 turns
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].role, TurnRole::User);
