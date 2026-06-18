@@ -2379,11 +2379,70 @@ fn remove_hermes_server(id: &str) -> Result<bool, AppCommandError> {
     Ok(removed)
 }
 
-fn read_qodercli_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
-    let path = dirs::home_dir()
-        .ok_or_else(|| mcp_configuration_invalid("cannot determine home directory"))?
+fn qodercli_config_path() -> PathBuf {
+    dirs::home_dir()
+        .expect("cannot determine home directory")
         .join(".qoder")
-        .join("settings.json");
+        .join("settings.json")
+}
+
+fn upsert_qodercli_server(id: &str, spec: &Value) -> Result<(), AppCommandError> {
+    let path = qodercli_config_path();
+    let mut root = read_json_file(&path)?;
+    if !root.is_object() {
+        root = json!({});
+    }
+
+    let canonical = canonicalize_spec(spec, "QoderCli write")?;
+
+    let obj = root.as_object_mut().ok_or_else(|| {
+        mcp_configuration_invalid(format!("invalid JSON root in {}", path.display()))
+    })?;
+    if !obj.get("mcpServers").map(Value::is_object).unwrap_or(false) {
+        obj.insert("mcpServers".to_string(), Value::Object(Map::new()));
+    }
+
+    let map = obj
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            mcp_configuration_invalid(format!("invalid mcpServers in {}", path.display()))
+        })?;
+    map.insert(id.to_string(), canonical);
+
+    write_json_file(&path, &root)
+}
+
+fn remove_qodercli_server(id: &str) -> Result<bool, AppCommandError> {
+    let path = qodercli_config_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let mut root = read_json_file(&path)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(false);
+    };
+    let Some(servers) = obj.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        return Ok(false);
+    };
+
+    let removed = servers.remove(id).is_some();
+    if removed {
+        if servers.is_empty() {
+            obj.remove("mcpServers");
+        }
+        if obj.is_empty() {
+            let _ = fs::remove_file(&path);
+        } else {
+            write_json_file(&path, &root)?;
+        }
+    }
+    Ok(removed)
+}
+
+fn read_qodercli_servers() -> Result<BTreeMap<String, Value>, AppCommandError> {
+    let path = qodercli_config_path();
     let Ok(raw) = fs::read_to_string(&path) else {
         return Ok(BTreeMap::new());
     };
