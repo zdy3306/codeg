@@ -1634,42 +1634,6 @@ async fn run_connection(
             },
             on_receive_request!(),
         )
-        .on_receive_request(
-            {
-                let runtime = terminal_runtime.clone();
-                async move |req: WaitForTerminalExitRequest,
-                            responder: Responder<WaitForTerminalExitResponse>,
-                            _cx: ConnectionTo<Agent>| {
-                    respond_terminal_request(responder, runtime.wait_for_terminal_exit(req).await)?;
-                    Ok(())
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let runtime = terminal_runtime.clone();
-                async move |req: KillTerminalRequest,
-                            responder: Responder<KillTerminalResponse>,
-                            _cx: ConnectionTo<Agent>| {
-                    respond_terminal_request(responder, runtime.kill_terminal(req).await)?;
-                    Ok(())
-                }
-            },
-            on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let runtime = terminal_runtime.clone();
-                async move |req: ReleaseTerminalRequest,
-                            responder: Responder<ReleaseTerminalResponse>,
-                            _cx: ConnectionTo<Agent>| {
-                    respond_terminal_request(responder, runtime.release_terminal(req).await)?;
-                    Ok(())
-                }
-            },
-            on_receive_request!(),
-        )
         .connect_with(agent, async move |cx| -> Result<(), sacp::Error> {
             let state = state_outer;
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
