@@ -62,6 +62,7 @@ const AGENT_TYPES: AgentType[] = [
   "open_claw",
   "cline",
   "hermes",
+  "qoder_cli",
 ]
 
 interface CachedSnapshot {

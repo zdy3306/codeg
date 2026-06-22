@@ -558,7 +558,6 @@ pub async fn spawn_agent_connection(
         };
 
         let delegation_for_cleanup = delegation_injection.clone();
-        let cleanup_working_dir = working_dir.clone();
         let result = run_connection(
             agent,
             conn_id.clone(),
@@ -594,11 +593,10 @@ pub async fn spawn_agent_connection(
             inj.questions.cancel_questions_by_parent(&conn_id).await;
         }
 
-        // Clean up the codeg-mcp entry from QoderCli's settings.local.json
+        // Clean up the codeg-mcp entry from QoderCli's global config
         // if we injected it via config file.
         if agent_type == AgentType::QoderCli {
-            let cleanup_cwd = resolve_working_dir(cleanup_working_dir.as_deref());
-            remove_qodercli_mcp_entry(&cleanup_cwd);
+            remove_qodercli_mcp_entry(&qodercli_global_config_path());
         }
 
         if let Err(e) = result {
@@ -1244,9 +1242,9 @@ async fn prepare_codeg_mcp_for_qodercli(
     // Note: for QoderCli this is not needed since it reads from config file,
     // but we skip this since the servers list is not passed here.
 
-    // Write the entry into QoderCli's project-level settings so it reads it
-    // at startup.
-    if let Err(e) = write_qodercli_mcp_entry(working_dir, &server) {
+    // Write the entry into QoderCli's global settings so it reads it at startup.
+    let global_config = qodercli_global_config_path();
+    if let Err(e) = write_qodercli_mcp_entry(&global_config, &server) {
         eprintln!(
             "[delegation][WARN] failed to write codeg-mcp entry to QoderCli \
              settings.local.json for connection {parent_connection_id}: {e}"
@@ -1261,19 +1259,27 @@ async fn prepare_codeg_mcp_for_qodercli(
     })
 }
 
-/// Write the `codeg-mcp` MCP server entry into `${project}/.qoder/settings.local.json`.
+/// Return the path to QoderCli's global config file (`~/.qoder/settings.json`).
+fn qodercli_global_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".qoder")
+        .join("settings.json")
+}
+
+/// Write the `codeg-mcp` MCP server entry into the given config file path.
 /// If the file doesn't exist it is created; if it exists the `mcpServers` map
 /// is merged (existing `codeg-mcp` entry is overwritten, other entries preserved).
-fn write_qodercli_mcp_entry(project_dir: &Path, server: &McpServerStdio) -> Result<(), String> {
-    let settings_dir = project_dir.join(".qoder");
-    std::fs::create_dir_all(&settings_dir)
-        .map_err(|e| format!("failed to create .qoder dir: {e}"))?;
-    let settings_path = settings_dir.join("settings.local.json");
-
+fn write_qodercli_mcp_entry(config_path: &Path, server: &McpServerStdio) -> Result<(), String> {
+    // Ensure parent directory exists.
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
+    }
     // Read existing config or start with empty object.
-    let mut root: serde_json::Value = if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path)
-            .map_err(|e| format!("failed to read settings.local.json: {e}"))?;
+    let mut root: serde_json::Value = if config_path.exists() {
+        let raw = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
         serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
@@ -1317,24 +1323,23 @@ fn write_qodercli_mcp_entry(project_dir: &Path, server: &McpServerStdio) -> Resu
 
     let pretty = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("failed to serialize settings: {e}"))?;
-    std::fs::write(&settings_path, pretty)
-        .map_err(|e| format!("failed to write settings.local.json: {e}"))?;
+    std::fs::write(config_path, pretty)
+        .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
     eprintln!(
         "[delegation] wrote codeg-mcp entry to {}",
-        settings_path.display()
+        config_path.display()
     );
     Ok(())
 }
 
-/// Remove the `codeg-mcp` entry from `${project}/.qoder/settings.local.json`.
+/// Remove the `codeg-mcp` entry from the given config file path.
 /// If the file only contained `codeg-mcp` in `mcpServers`, the entire
-/// `mcpServers` object (or even the file) is cleaned up.
-fn remove_qodercli_mcp_entry(project_dir: &Path) {
-    let settings_path = project_dir.join(".qoder").join("settings.local.json");
-    if !settings_path.exists() {
+/// `mcpServers` object is cleaned up.
+fn remove_qodercli_mcp_entry(config_path: &Path) {
+    if !config_path.exists() {
         return;
     }
-    let Ok(raw) = std::fs::read_to_string(&settings_path) else {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
         return;
     };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -1359,16 +1364,16 @@ fn remove_qodercli_mcp_entry(project_dir: &Path) {
         }
         // If the entire root is empty, remove the file.
         if root.as_object().is_some_and(|o| o.is_empty()) {
-            let _ = std::fs::remove_file(&settings_path);
+            let _ = std::fs::remove_file(config_path);
             eprintln!(
-                "[delegation] removed empty settings.local.json ({})",
-                settings_path.display()
+                "[delegation] removed empty config file ({})",
+                config_path.display()
             );
         } else if let Ok(pretty) = serde_json::to_string_pretty(&root) {
-            let _ = std::fs::write(&settings_path, pretty);
+            let _ = std::fs::write(config_path, pretty);
             eprintln!(
                 "[delegation] removed codeg-mcp entry from {}",
-                settings_path.display()
+                config_path.display()
             );
         }
     }
