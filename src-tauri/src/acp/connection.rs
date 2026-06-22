@@ -1247,7 +1247,9 @@ async fn prepare_codeg_mcp_for_qodercli(
     ]);
 
     // Write the entry into QoderCli's global settings so it reads it at startup.
+    // First clean all stale codeg-mcp-* entries from previous sessions.
     let global_config = qodercli_global_config_path();
+    remove_all_qodercli_mcp_entries(&global_config);
     if let Err(e) = write_qodercli_mcp_entry(&global_config, &server, &server_name) {
         eprintln!(
             "[delegation][WARN] failed to write {server_name} entry to QoderCli \
@@ -1358,28 +1360,65 @@ fn remove_qodercli_mcp_entry(config_path: &Path, server_name: &str) {
     };
 
     if changed {
-        // If mcpServers is now empty, remove it too.
-        if let Some(servers) = root.get("mcpServers").and_then(|v| v.as_object()) {
-            if servers.is_empty() {
-                if let Some(obj) = root.as_object_mut() {
-                    obj.remove("mcpServers");
-                }
+        cleanup_empty_mcp_servers(&mut root, config_path);
+    }
+}
+
+/// Remove all `codeg-mcp-*` entries from the config file.
+/// Called before writing a new entry to prevent stale entries from accumulating.
+fn remove_all_qodercli_mcp_entries(config_path: &Path) {
+    if !config_path.exists() {
+        return;
+    }
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return;
+    };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+
+    let removed = if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut())
+    {
+        let keys: Vec<String> = servers
+            .keys()
+            .filter(|k| k.starts_with("codeg-mcp-"))
+            .cloned()
+            .collect();
+        let count = keys.len();
+        for key in &keys {
+            servers.remove(key.as_str());
+        }
+        count
+    } else {
+        0
+    };
+
+    if removed > 0 {
+        cleanup_empty_mcp_servers(&mut root, config_path);
+        eprintln!(
+            "[delegation] cleaned {removed} stale codeg-mcp entries from {}",
+            config_path.display()
+        );
+    }
+}
+
+/// Clean up empty `mcpServers` object and empty root file after entry removal.
+fn cleanup_empty_mcp_servers(root: &mut serde_json::Value, config_path: &Path) {
+    if let Some(servers) = root.get("mcpServers").and_then(|v| v.as_object()) {
+        if servers.is_empty() {
+            if let Some(obj) = root.as_object_mut() {
+                obj.remove("mcpServers");
             }
         }
-        // If the entire root is empty, remove the file.
-        if root.as_object().is_some_and(|o| o.is_empty()) {
-            let _ = std::fs::remove_file(config_path);
-            eprintln!(
-                "[delegation] removed empty config file ({})",
-                config_path.display()
-            );
-        } else if let Ok(pretty) = serde_json::to_string_pretty(&root) {
-            let _ = std::fs::write(config_path, pretty);
-            eprintln!(
-                "[delegation] removed {server_name} entry from {}",
-                config_path.display()
-            );
-        }
+    }
+    if root.as_object().is_some_and(|o| o.is_empty()) {
+        let _ = std::fs::remove_file(config_path);
+        eprintln!(
+            "[delegation] removed empty config file ({})",
+            config_path.display()
+        );
+    } else if let Ok(pretty) = serde_json::to_string_pretty(root) {
+        let _ = std::fs::write(config_path, pretty);
     }
 }
 
