@@ -593,10 +593,11 @@ pub async fn spawn_agent_connection(
             inj.questions.cancel_questions_by_parent(&conn_id).await;
         }
 
-        // Clean up the codeg-mcp entry from QoderCli's global config
+        // Clean up the codeg-mcp entry from QoderCli's config
         // if we injected it via config file.
         if agent_type == AgentType::QoderCli {
-            remove_qodercli_mcp_entry(&qodercli_global_config_path());
+            let server_name = format!("codeg-mcp-{conn_id}");
+            remove_qodercli_mcp_entry(&qodercli_global_config_path(), &server_name);
         }
 
         if let Err(e) = result {
@@ -1181,9 +1182,13 @@ async fn inject_codeg_mcp(
 }
 
 /// QoderCli does not process `mcpServers` from ACP `session/new`; it only
-/// reads MCP config from its own settings files at startup.  To inject
-/// `codeg-mcp` we write the entry into `${project}/.qoder/settings.local.json`
-/// BEFORE the agent process starts, and remove it on disconnect.
+/// reads MCP config from its own settings files at startup.  To inject the
+/// companion we write a `codeg-mcp-<connection_id>` entry into
+/// `~/.qoder/settings.json` BEFORE the agent process starts, and remove it
+/// on disconnect.
+///
+/// Each session writes a unique entry keyed by `codeg-mcp-<connection_id>` so
+/// multiple concurrent QoderCli sessions don't overwrite each other's companion.
 ///
 /// Returns `Some(CompanionInjection)` on success, `None` when injection was
 /// skipped (features disabled, binary missing, or write failed).
@@ -1223,8 +1228,11 @@ async fn prepare_codeg_mcp_for_qodercli(
         )
         .await;
 
-    // Build the MCP server entry for the companion.
-    let mut server = McpServerStdio::new("codeg-mcp", binary_path.clone());
+    // Build the MCP server entry for the companion. Use the full connection ID
+    // as the server name so multiple concurrent QoderCli sessions each write a
+    // unique entry to ~/.qoder/settings.json without overwriting each other.
+    let server_name = format!("codeg-mcp-{parent_connection_id}");
+    let mut server = McpServerStdio::new(&server_name, binary_path.clone());
     server = server.args(vec![
         "--parent-connection-id".to_string(),
         parent_connection_id.to_string(),
@@ -1237,17 +1245,13 @@ async fn prepare_codeg_mcp_for_qodercli(
         "--features".to_string(),
         features_arg,
     ]);
-    // Add to the MCP server list so it's also sent via session/new (for agents
-    // that DO process mcpServers, this is a harmless duplicate).
-    // Note: for QoderCli this is not needed since it reads from config file,
-    // but we skip this since the servers list is not passed here.
 
     // Write the entry into QoderCli's global settings so it reads it at startup.
     let global_config = qodercli_global_config_path();
-    if let Err(e) = write_qodercli_mcp_entry(&global_config, &server) {
+    if let Err(e) = write_qodercli_mcp_entry(&global_config, &server, &server_name) {
         eprintln!(
-            "[delegation][WARN] failed to write codeg-mcp entry to QoderCli \
-             settings.local.json for connection {parent_connection_id}: {e}"
+            "[delegation][WARN] failed to write {server_name} entry to QoderCli \
+             settings.json for connection {parent_connection_id}: {e}"
         );
         // Still return the injection so token registration / cleanup works;
         // the agent just won't have the companion via config file.
@@ -1267,10 +1271,10 @@ fn qodercli_global_config_path() -> PathBuf {
         .join("settings.json")
 }
 
-/// Write the `codeg-mcp` MCP server entry into the given config file path.
+/// Write an MCP server entry into the given config file path.
 /// If the file doesn't exist it is created; if it exists the `mcpServers` map
-/// is merged (existing `codeg-mcp` entry is overwritten, other entries preserved).
-fn write_qodercli_mcp_entry(config_path: &Path, server: &McpServerStdio) -> Result<(), String> {
+/// is merged (existing entry with the same name is overwritten, others preserved).
+fn write_qodercli_mcp_entry(config_path: &Path, server: &McpServerStdio, server_name: &str) -> Result<(), String> {
     // Ensure parent directory exists.
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1319,23 +1323,23 @@ fn write_qodercli_mcp_entry(config_path: &Path, server: &McpServerStdio) -> Resu
         entry["env"] = serde_json::Value::Object(env);
     }
 
-    root["mcpServers"]["codeg-mcp"] = entry;
+    root["mcpServers"][server_name] = entry;
 
     let pretty = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("failed to serialize settings: {e}"))?;
     std::fs::write(config_path, pretty)
         .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
     eprintln!(
-        "[delegation] wrote codeg-mcp entry to {}",
+        "[delegation] wrote {server_name} entry to {}",
         config_path.display()
     );
     Ok(())
 }
 
-/// Remove the `codeg-mcp` entry from the given config file path.
-/// If the file only contained `codeg-mcp` in `mcpServers`, the entire
+/// Remove an MCP server entry from the given config file path.
+/// If the file only contained that entry in `mcpServers`, the entire
 /// `mcpServers` object is cleaned up.
-fn remove_qodercli_mcp_entry(config_path: &Path) {
+fn remove_qodercli_mcp_entry(config_path: &Path, server_name: &str) {
     if !config_path.exists() {
         return;
     }
@@ -1348,7 +1352,7 @@ fn remove_qodercli_mcp_entry(config_path: &Path) {
 
     let changed = if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut())
     {
-        servers.remove("codeg-mcp").is_some()
+        servers.remove(server_name).is_some()
     } else {
         false
     };
@@ -1372,7 +1376,7 @@ fn remove_qodercli_mcp_entry(config_path: &Path) {
         } else if let Ok(pretty) = serde_json::to_string_pretty(&root) {
             let _ = std::fs::write(config_path, pretty);
             eprintln!(
-                "[delegation] removed codeg-mcp entry from {}",
+                "[delegation] removed {server_name} entry from {}",
                 config_path.display()
             );
         }
@@ -1506,8 +1510,9 @@ async fn run_connection(
     let state_outer = Arc::clone(&state);
 
     // For QoderCli, inject codeg-mcp via config file BEFORE the agent starts.
-    // QoderCli reads MCP config from ~/.qoder/settings.json / .qoder/settings.local.json
-    // at startup and does NOT process mcpServers from ACP session/new.
+    // QoderCli reads MCP config from ~/.qoder/settings.json at startup and
+    // does NOT process mcpServers from ACP session/new. Each session writes a
+    // unique entry keyed by `codeg-mcp-<connection_id>` to avoid conflicts.
     let qodercli_companion = if agent_type == AgentType::QoderCli {
         if let Some(inj) = delegation_injection.as_ref() {
             prepare_codeg_mcp_for_qodercli(
