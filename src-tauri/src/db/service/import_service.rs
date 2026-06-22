@@ -56,7 +56,7 @@ pub async fn import_local_conversations(
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error listing {} conversations: {}", at, e);
+                    tracing::error!("Error listing {} conversations: {}", at, e);
                 }
             }
         }
@@ -153,6 +153,9 @@ async fn import_one(
         title_locked: Set(false),
         agent_type: Set(at_str),
         status: Set(conversation::ConversationStatus::Completed),
+        // Imports scan regular folders' session files; chat scratch dirs and
+        // loop runs are never import targets, so every imported row is regular.
+        kind: Set(conversation::ConversationKind::Regular),
         model: Set(summary.model.clone()),
         git_branch: Set(summary.git_branch.clone()),
         external_id: Set(Some(summary.id.clone())),
@@ -364,6 +367,7 @@ mod tests {
             title_locked: Set(false),
             agent_type: Set(at_str),
             status: Set(conversation::ConversationStatus::Completed),
+            kind: Set(conversation::ConversationKind::Delegate),
             model: Set(None),
             git_branch: Set(None),
             external_id: Set(Some("child-ext".to_string())),
