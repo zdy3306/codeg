@@ -502,6 +502,31 @@ pub async fn spawn_agent_connection(
         crate::commands::acp::reconcile_hermes_runtime_env(&runtime_env);
     }
 
+    // For QoderCli, inject codeg-mcp via config file BEFORE the agent starts.
+    // QoderCli reads MCP config from ~/.qoder/settings.json at startup, so the
+    // config must be written before build_agent spawns the process.
+    let qodercli_companion = if agent_type == AgentType::QoderCli {
+        if let Some(inj) = delegation_injection.as_ref() {
+            let cwd = resolve_working_dir(working_dir.as_deref());
+            prepare_codeg_mcp_for_qodercli(
+                inj,
+                &connection_id,
+                &cwd,
+            )
+            .await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Stash the companion info on session state so cleanup can revoke the token.
+    if let Some(ref injected) = qodercli_companion {
+        let mut s = session_state.write().await;
+        s.delegation_token = Some(injected.token.clone());
+        s.feedback_tool_available = injected.feedback_available;
+    }
+
     let agent = build_agent(agent_type, &runtime_env).await?;
 
     // Forward only the codeg git credential helper keys into the terminal
@@ -1247,9 +1272,10 @@ async fn prepare_codeg_mcp_for_qodercli(
     ]);
 
     // Write the entry into QoderCli's global settings so it reads it at startup.
-    // First clean all stale codeg-mcp-* entries from previous sessions.
+    // Don't remove other sessions' entries - only manage our own via
+    // remove_qodercli_mcp_entry on connection teardown. This avoids a race
+    // condition where concurrent QoderCli sessions overwrite each other's entries.
     let global_config = qodercli_global_config_path();
-    remove_all_qodercli_mcp_entries(&global_config);
     if let Err(e) = write_qodercli_mcp_entry(&global_config, &server, &server_name) {
         eprintln!(
             "[delegation][WARN] failed to write {server_name} entry to QoderCli \
@@ -1361,44 +1387,6 @@ fn remove_qodercli_mcp_entry(config_path: &Path, server_name: &str) {
 
     if changed {
         cleanup_empty_mcp_servers(&mut root, config_path);
-    }
-}
-
-/// Remove all `codeg-mcp-*` entries from the config file.
-/// Called before writing a new entry to prevent stale entries from accumulating.
-fn remove_all_qodercli_mcp_entries(config_path: &Path) {
-    if !config_path.exists() {
-        return;
-    }
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return;
-    };
-    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return;
-    };
-
-    let removed = if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut())
-    {
-        let keys: Vec<String> = servers
-            .keys()
-            .filter(|k| k.starts_with("codeg-mcp-"))
-            .cloned()
-            .collect();
-        let count = keys.len();
-        for key in &keys {
-            servers.remove(key.as_str());
-        }
-        count
-    } else {
-        0
-    };
-
-    if removed > 0 {
-        cleanup_empty_mcp_servers(&mut root, config_path);
-        eprintln!(
-            "[delegation] cleaned {removed} stale codeg-mcp entries from {}",
-            config_path.display()
-        );
     }
 }
 
@@ -1557,31 +1545,6 @@ async fn run_connection(
     let emitter_clone = emitter.clone();
     let perms = pending_perms.clone();
     let state_outer = Arc::clone(&state);
-
-    // For QoderCli, inject codeg-mcp via config file BEFORE the agent starts.
-    // QoderCli reads MCP config from ~/.qoder/settings.json at startup and
-    // does NOT process mcpServers from ACP session/new. Each session writes a
-    // unique entry keyed by `codeg-mcp-<connection_id>` to avoid conflicts.
-    let qodercli_companion = if agent_type == AgentType::QoderCli {
-        if let Some(inj) = delegation_injection.as_ref() {
-            prepare_codeg_mcp_for_qodercli(
-                inj,
-                &conn_id,
-                &cwd,
-            )
-            .await
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // Stash the companion info on session state so cleanup can revoke the token.
-    if let Some(ref injected) = qodercli_companion {
-        let mut s = state.write().await;
-        s.delegation_token = Some(injected.token.clone());
-        s.feedback_tool_available = injected.feedback_available;
-    }
 
     Client
         .builder()
