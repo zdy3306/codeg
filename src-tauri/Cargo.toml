@@ -51,11 +51,6 @@ name = "codeg-mcp"
 path = "src/bin/codeg_mcp.rs"
 required-features = []
 
-[[bin]]
-name = "codeg-mcp-proxy"
-path = "src/bin/codeg_mcp_proxy.rs"
-required-features = []
-
 [build-dependencies]
 tauri-build = { version = "2", features = [], optional = true }
 
