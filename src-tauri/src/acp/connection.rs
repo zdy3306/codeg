@@ -502,31 +502,6 @@ pub async fn spawn_agent_connection(
         crate::commands::acp::reconcile_hermes_runtime_env(&runtime_env);
     }
 
-    // For QoderCli, inject codeg-mcp via config file BEFORE the agent starts.
-    // QoderCli reads MCP config from ~/.qoder/settings.json at startup, so the
-    // config must be written before build_agent spawns the process.
-    let qodercli_companion = if agent_type == AgentType::QoderCli {
-        if let Some(inj) = delegation_injection.as_ref() {
-            let cwd = resolve_working_dir(working_dir.as_deref());
-            prepare_codeg_mcp_for_qodercli(
-                inj,
-                &connection_id,
-                &cwd,
-            )
-            .await
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    // Stash the companion info on session state so cleanup can revoke the token.
-    if let Some(ref injected) = qodercli_companion {
-        let mut s = session_state.write().await;
-        s.delegation_token = Some(injected.token.clone());
-        s.feedback_tool_available = injected.feedback_available;
-    }
-
     let agent = build_agent(agent_type, &runtime_env).await?;
 
     // Forward only the codeg git credential helper keys into the terminal
@@ -618,12 +593,9 @@ pub async fn spawn_agent_connection(
             inj.questions.cancel_questions_by_parent(&conn_id).await;
         }
 
-        // Clean up the codeg-mcp entry from QoderCli's config
-        // if we injected it via config file.
-        if agent_type == AgentType::QoderCli {
-            let server_name = format!("codeg-mcp-{conn_id}");
-            remove_qodercli_mcp_entry(&qodercli_global_config_path(), &server_name);
-        }
+        // QoderCli: the shared "codeg-mcp" entry is NOT removed on disconnect.
+        // It is overwritten on the next session launch.  The in-memory token is
+        // revoked above, so the old entry's token is dead regardless.
 
         if let Err(e) = result {
             let code = e.code().map(String::from);
@@ -918,20 +890,52 @@ fn claude_raw_sdk_session_meta(
     Some(meta)
 }
 
+/// Either a typed `NewSessionRequest` or an `UntypedMessage` for agents
+/// (like QoderCli) whose ACP adapter requires a non-standard wire format.
+enum SessionNewRequest {
+    Typed(NewSessionRequest),
+    Untyped(UntypedMessage),
+}
+
 fn build_new_session_request(
     agent_type: AgentType,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
-) -> NewSessionRequest {
+) -> SessionNewRequest {
+    // QoderCli's session/new mcpServers schema requires dummy fields from
+    // all transport types.  `inject_codeg_mcp` stores the padded JSON in a
+    // thread-local; we send it as an UntypedMessage to bypass sacp's
+    // McpServerStdio serialization which lacks those fields.
+    if agent_type == AgentType::QoderCli {
+        let entry = QODERCLI_MCP_ENTRY.with(|cell| cell.borrow().clone());
+        if let Some(entry) = entry {
+            let mcp_array = serde_json::json!([entry]);
+            let params = serde_json::json!({
+                "cwd": cwd.to_string_lossy(),
+                "mcpServers": mcp_array,
+            });
+            return match UntypedMessage::new("session/new", params) {
+                Ok(msg) => SessionNewRequest::Untyped(msg),
+                Err(_) => {
+                    // Fallback: send without mcpServers.
+                    let params = serde_json::json!({ "cwd": cwd.to_string_lossy() });
+                    SessionNewRequest::Untyped(
+                        UntypedMessage::new("session/new", params)
+                            .expect("valid session/new params"),
+                    )
+                }
+            };
+        }
+    }
+
     let mut req = NewSessionRequest::new(cwd.to_path_buf());
     if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
         req = req.meta(meta);
     }
-    // QoderCli requires mcpServers to always be present (even if empty).
-    if agent_type == AgentType::QoderCli || !mcp_servers.is_empty() {
+    if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
-    req
+    SessionNewRequest::Typed(req)
 }
 
 fn build_load_session_request(
@@ -944,8 +948,7 @@ fn build_load_session_request(
     if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
         req = req.meta(meta);
     }
-    // QoderCli requires mcpServers to always be present (even if empty).
-    if agent_type == AgentType::QoderCli || !mcp_servers.is_empty() {
+    if !mcp_servers.is_empty() {
         req = req.mcp_servers(mcp_servers);
     }
     req
@@ -1140,11 +1143,19 @@ struct CompanionInjection {
     feedback_available: bool,
 }
 
+// Thread-local to pass QoderCli's padded MCP entry from `inject_codeg_mcp`
+// to `build_new_session_request`.  Both run in the same `run_connection`
+// task, so the thread-local is always available when needed.
+thread_local! {
+    static QODERCLI_MCP_ENTRY: std::cell::RefCell<Option<serde_json::Value>> = const { std::cell::RefCell::new(None) };
+}
+
 async fn inject_codeg_mcp(
     servers: &mut Vec<McpServer>,
     injection: &DelegationInjection,
     parent_connection_id: &str,
     working_dir: &Path,
+    agent_type: AgentType,
 ) -> Option<CompanionInjection> {
     // codeg-mcp carries BOTH the delegation tools and the live-feedback tool.
     // Inject it when EITHER feature is enabled; the `--features` arg tells the
@@ -1199,215 +1210,35 @@ async fn inject_codeg_mcp(
         "--features".to_string(),
         features_arg,
     ]);
-    servers.push(McpServer::Stdio(server));
-    Some(CompanionInjection {
-        token,
-        feedback_available: feedback_enabled,
-    })
-}
 
-/// QoderCli does not process `mcpServers` from ACP `session/new`; it only
-/// reads MCP config from its own settings files at startup.  To inject the
-/// companion we write a `codeg-mcp-<connection_id>` entry into
-/// `~/.qoder/settings.json` BEFORE the agent process starts, and remove it
-/// on disconnect.
-///
-/// Each session writes a unique entry keyed by `codeg-mcp-<connection_id>` so
-/// multiple concurrent QoderCli sessions don't overwrite each other's companion.
-///
-/// Returns `Some(CompanionInjection)` on success, `None` when injection was
-/// skipped (features disabled, binary missing, or write failed).
-async fn prepare_codeg_mcp_for_qodercli(
-    injection: &DelegationInjection,
-    parent_connection_id: &str,
-    working_dir: &Path,
-) -> Option<CompanionInjection> {
-    let delegation_enabled = injection.broker.config_snapshot().await.enabled;
-    let feedback_enabled = injection.feedback.is_enabled().await;
-    let ask_enabled = injection.ask.is_enabled().await;
-    let sessions_enabled = injection.sessions.is_enabled().await;
-    let features_arg = companion_features_arg(
-        delegation_enabled,
-        feedback_enabled,
-        ask_enabled,
-        sessions_enabled,
-    )?;
-    let Some(binary_path) = locate_codeg_mcp_binary() else {
-        eprintln!(
-            "[delegation][WARN] codeg-mcp companion binary not found (checked CODEG_MCP_BIN, \
-             exe sibling, and PATH); skipping delegate_to_agent / check_user_feedback / \
-             ask_user_question / get_session_info tool injection for QoderCli connection \
-             {parent_connection_id}. Reinstall codeg or set CODEG_MCP_BIN to fix."
-        );
-        return None;
-    };
-    let token = uuid::Uuid::new_v4().to_string();
-    injection
-        .tokens
-        .register(
-            token.clone(),
-            crate::acp::delegation::listener::TokenEntry {
-                parent_connection_id: parent_connection_id.to_string(),
-                working_dir: working_dir.to_path_buf(),
-            },
-        )
-        .await;
-
-    // Build the MCP server entry for the companion. Use the full connection ID
-    // as the server name so multiple concurrent QoderCli sessions each write a
-    // unique entry to ~/.qoder/settings.json without overwriting each other.
-    let server_name = format!("codeg-mcp-{parent_connection_id}");
-    let mut server = McpServerStdio::new(&server_name, binary_path.clone());
-    server = server.args(vec![
-        "--parent-connection-id".to_string(),
-        parent_connection_id.to_string(),
-        "--socket-path".to_string(),
-        injection.socket_path.to_string_lossy().to_string(),
-        "--token".to_string(),
-        token.clone(),
-        "--parent-pid".to_string(),
-        std::process::id().to_string(),
-        "--features".to_string(),
-        features_arg,
-    ]);
-
-    // Write the entry into QoderCli's global settings so it reads it at startup.
-    // Don't remove other sessions' entries - only manage our own via
-    // remove_qodercli_mcp_entry on connection teardown. This avoids a race
-    // condition where concurrent QoderCli sessions overwrite each other's entries.
-    let global_config = qodercli_global_config_path();
-    if let Err(e) = write_qodercli_mcp_entry(&global_config, &server, &server_name) {
-        eprintln!(
-            "[delegation][WARN] failed to write {server_name} entry to QoderCli \
-             settings.json for connection {parent_connection_id}: {e}"
-        );
-        // Still return the injection so token registration / cleanup works;
-        // the agent just won't have the companion via config file.
-    }
-
-    Some(CompanionInjection {
-        token,
-        feedback_available: feedback_enabled,
-    })
-}
-
-/// Return the path to QoderCli's global config file (`~/.qoder/settings.json`).
-fn qodercli_global_config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qoder")
-        .join("settings.json")
-}
-
-/// Write an MCP server entry into the given config file path.
-/// If the file doesn't exist it is created; if it exists the `mcpServers` map
-/// is merged (existing entry with the same name is overwritten, others preserved).
-fn write_qodercli_mcp_entry(config_path: &Path, server: &McpServerStdio, server_name: &str) -> Result<(), String> {
-    // Ensure parent directory exists.
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
-    }
-    // Read existing config or start with empty object.
-    let mut root: serde_json::Value = if config_path.exists() {
-        let raw = std::fs::read_to_string(config_path)
-            .map_err(|e| format!("failed to read {}: {e}", config_path.display()))?;
-        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    // Ensure root is an object.
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
-
-    // Ensure mcpServers is an object.
-    if !root.get("mcpServers").is_some_and(|v| v.is_object()) {
-        root["mcpServers"] = serde_json::json!({});
-    }
-
-    // Serialize the McpServerStdio into the config format.
-    let command = server
-        .command
-        .to_str()
-        .unwrap_or_default()
-        .to_string();
-    let args: Vec<String> = server.args.clone();
-    let env: serde_json::Map<String, serde_json::Value> = server
-        .env
-        .iter()
-        .map(|e| (e.name.clone(), serde_json::Value::String(e.value.clone())))
-        .collect();
-
-    let mut entry = serde_json::json!({
-        "type": "stdio",
-        "command": command,
-    });
-    if !args.is_empty() {
-        entry["args"] = serde_json::to_value(&args).unwrap_or_default();
-    }
-    if !env.is_empty() {
-        entry["env"] = serde_json::Value::Object(env);
-    }
-
-    root["mcpServers"][server_name] = entry;
-
-    let pretty = serde_json::to_string_pretty(&root)
-        .map_err(|e| format!("failed to serialize settings: {e}"))?;
-    std::fs::write(config_path, pretty)
-        .map_err(|e| format!("failed to write {}: {e}", config_path.display()))?;
-    eprintln!(
-        "[delegation] wrote {server_name} entry to {}",
-        config_path.display()
-    );
-    Ok(())
-}
-
-/// Remove an MCP server entry from the given config file path.
-/// If the file only contained that entry in `mcpServers`, the entire
-/// `mcpServers` object is cleaned up.
-fn remove_qodercli_mcp_entry(config_path: &Path, server_name: &str) {
-    if !config_path.exists() {
-        return;
-    }
-    let Ok(raw) = std::fs::read_to_string(config_path) else {
-        return;
-    };
-    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return;
-    };
-
-    let changed = if let Some(servers) = root.get_mut("mcpServers").and_then(|v| v.as_object_mut())
-    {
-        servers.remove(server_name).is_some()
-    } else {
-        false
-    };
-
-    if changed {
-        cleanup_empty_mcp_servers(&mut root, config_path);
-    }
-}
-
-/// Clean up empty `mcpServers` object and empty root file after entry removal.
-fn cleanup_empty_mcp_servers(root: &mut serde_json::Value, config_path: &Path) {
-    if let Some(servers) = root.get("mcpServers").and_then(|v| v.as_object()) {
-        if servers.is_empty() {
-            if let Some(obj) = root.as_object_mut() {
-                obj.remove("mcpServers");
-            }
+    // QoderCli's session/new mcpServers schema has a validation quirk:
+    // it requires fields from ALL transport types (stdio + http) to be
+    // present simultaneously.  We serialize the stdio entry to JSON and
+    // pad it with dummy http fields so validation passes.
+    if agent_type == AgentType::QoderCli {
+        let mut entry = serde_json::to_value(&server).unwrap_or(serde_json::json!({}));
+        // Ensure required fields from all transport types are present.
+        entry["id"] = serde_json::json!("codeg-mcp");
+        entry["type"] = serde_json::json!("stdio");
+        if !entry.get("url").is_some() {
+            entry["url"] = serde_json::json!("http://127.0.0.1:1");
         }
+        if !entry.get("headers").is_some() {
+            entry["headers"] = serde_json::json!([]);
+        }
+        QODERCLI_MCP_ENTRY.with(|cell| {
+            *cell.borrow_mut() = Some(entry);
+        });
+        // Don't push to servers — build_new_session_request will use the
+        // padded entry via UntypedMessage instead.
+    } else {
+        servers.push(McpServer::Stdio(server));
     }
-    if root.as_object().is_some_and(|o| o.is_empty()) {
-        let _ = std::fs::remove_file(config_path);
-        eprintln!(
-            "[delegation] removed empty config file ({})",
-            config_path.display()
-        );
-    } else if let Ok(pretty) = serde_json::to_string_pretty(root) {
-        let _ = std::fs::write(config_path, pretty);
-    }
+
+    Some(CompanionInjection {
+        token,
+        feedback_available: feedback_enabled,
+    })
 }
 
 /// Resolve an MCP server `command` to an absolute path.
@@ -1771,7 +1602,7 @@ async fn run_connection(
             // filter needed. The returned token is stashed on the session
             // state so connection teardown can revoke it.
             let delegate_injection = if let Some(inj) = delegation_injection.as_ref() {
-                inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd).await
+                inject_codeg_mcp(&mut mcp_servers, inj, &conn_id, &cwd, agent_type).await
             } else {
                 None
             };
@@ -2003,17 +1834,23 @@ async fn run_connection(
                             )
                             .await;
                         }
-                        let new_resp = cx
-                            .send_request_to(
-                                Agent,
-                                build_new_session_request(
+                        let new_resp = match build_new_session_request(
                                     agent_type,
                                     &cwd,
                                     mcp_servers.clone(),
-                                ),
-                            )
-                            .block_task()
-                            .await?;
+                                ) {
+                            SessionNewRequest::Typed(req) => {
+                                cx.send_request_to(Agent, req).block_task().await?
+                            }
+                            SessionNewRequest::Untyped(msg) => {
+                                let raw = cx.send_request_to(Agent, msg).block_task().await?;
+                                serde_json::from_value(raw).map_err(|e| {
+                                    sacp::util::internal_error(format!(
+                                        "Failed to parse QoderCli session/new response: {e}"
+                                    ))
+                                })?
+                            }
+                        };
                         let fallback_sid = new_resp.session_id.0.to_string();
                         let initial_config_options = new_resp.config_options.clone();
                         let mut session = cx.attach_session(new_resp, Default::default())?;
@@ -2081,13 +1918,19 @@ async fn run_connection(
                 }
             } else {
                 // Create new session
-                let new_resp = cx
-                    .send_request_to(
-                        Agent,
-                        build_new_session_request(agent_type, &cwd, mcp_servers.clone()),
-                    )
-                    .block_task()
-                    .await?;
+                let new_resp = match build_new_session_request(agent_type, &cwd, mcp_servers.clone()) {
+                    SessionNewRequest::Typed(req) => {
+                        cx.send_request_to(Agent, req).block_task().await?
+                    }
+                    SessionNewRequest::Untyped(msg) => {
+                        let raw = cx.send_request_to(Agent, msg).block_task().await?;
+                        serde_json::from_value(raw).map_err(|e| {
+                            sacp::util::internal_error(format!(
+                                "Failed to parse QoderCli session/new response: {e}"
+                            ))
+                        })?
+                    }
+                };
                 let sid = new_resp.session_id.0.to_string();
                 let initial_config_options = new_resp.config_options.clone();
                 let mut session = cx.attach_session(new_resp, Default::default())?;
@@ -4424,7 +4267,10 @@ mod tests {
     #[test]
     fn build_new_session_request_sets_claude_raw_meta() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
-        let req = build_new_session_request(AgentType::ClaudeCode, &cwd, Vec::new());
+        let req = match build_new_session_request(AgentType::ClaudeCode, &cwd, Vec::new()) {
+            SessionNewRequest::Typed(r) => r,
+            _ => panic!("expected typed request for ClaudeCode"),
+        };
 
         assert_eq!(
             req.meta
@@ -4897,6 +4743,7 @@ mod tests {
             &injection,
             "parent-conn",
             std::path::Path::new("/tmp"),
+            AgentType::ClaudeCode,
         )
         .await;
 
