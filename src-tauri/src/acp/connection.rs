@@ -901,14 +901,14 @@ fn build_new_session_request(
     agent_type: AgentType,
     cwd: &Path,
     mcp_servers: Vec<McpServer>,
+    qodercli_entry: Option<serde_json::Value>,
 ) -> SessionNewRequest {
-    // QoderCli's session/new mcpServers schema requires dummy fields from
-    // all transport types.  `inject_codeg_mcp` stores the padded JSON in a
-    // thread-local; we send it as an UntypedMessage to bypass sacp's
-    // McpServerStdio serialization which lacks those fields.
+    // QoderCli session/new mcpServers schema requires dummy fields from
+    // all transport types.  The padded JSON is passed from `inject_codeg_mcp`
+    // via `CompanionInjection.qodercli_entry`; we send it as an
+    // `UntypedMessage` to bypass sacp's `McpServerStdio` serialization.
     if agent_type == AgentType::QoderCli {
-        let entry = QODERCLI_MCP_ENTRY.with(|cell| cell.borrow().clone());
-        if let Some(entry) = entry {
+        if let Some(entry) = qodercli_entry {
             let mcp_array = serde_json::json!([entry]);
             let params = serde_json::json!({
                 "cwd": cwd.to_string_lossy(),
@@ -1141,13 +1141,10 @@ fn companion_features_arg(
 struct CompanionInjection {
     token: String,
     feedback_available: bool,
-}
-
-// Thread-local to pass QoderCli's padded MCP entry from `inject_codeg_mcp`
-// to `build_new_session_request`.  Both run in the same `run_connection`
-// task, so the thread-local is always available when needed.
-thread_local! {
-    static QODERCLI_MCP_ENTRY: std::cell::RefCell<Option<serde_json::Value>> = const { std::cell::RefCell::new(None) };
+    /// QoderCli only: the padded MCP server JSON entry with dummy http
+    /// fields, carried from `inject_codeg_mcp` to `build_new_session_request`
+    /// so the caller can send it via `UntypedMessage`.
+    qodercli_entry: Option<serde_json::Value>,
 }
 
 async fn inject_codeg_mcp(
@@ -1211,7 +1208,7 @@ async fn inject_codeg_mcp(
         features_arg,
     ]);
 
-    // QoderCli's session/new mcpServers schema has a validation quirk:
+    // QoderCli session/new mcpServers schema has a validation quirk:
     // it requires fields from ALL transport types (stdio + http) to be
     // present simultaneously.  We serialize the stdio entry to JSON and
     // pad it with dummy http fields so validation passes.
@@ -1220,17 +1217,21 @@ async fn inject_codeg_mcp(
         // Ensure required fields from all transport types are present.
         entry["id"] = serde_json::json!("codeg-mcp");
         entry["type"] = serde_json::json!("stdio");
-        if !entry.get("url").is_some() {
+        if entry.get("url").is_none() {
             entry["url"] = serde_json::json!("http://127.0.0.1:1");
         }
-        if !entry.get("headers").is_some() {
+        if entry.get("headers").is_none() {
             entry["headers"] = serde_json::json!([]);
         }
-        QODERCLI_MCP_ENTRY.with(|cell| {
-            *cell.borrow_mut() = Some(entry);
-        });
+        // Carry the padded entry back to the caller for UntypedMessage.
+        let qodercli_entry = Some(entry);
         // Don't push to servers — build_new_session_request will use the
         // padded entry via UntypedMessage instead.
+        return Some(CompanionInjection {
+            token,
+            feedback_available: feedback_enabled,
+            qodercli_entry,
+        });
     } else {
         servers.push(McpServer::Stdio(server));
     }
@@ -1238,6 +1239,7 @@ async fn inject_codeg_mcp(
     Some(CompanionInjection {
         token,
         feedback_available: feedback_enabled,
+        qodercli_entry: None,
     })
 }
 
@@ -1606,6 +1608,9 @@ async fn run_connection(
             } else {
                 None
             };
+            let qodercli_entry = delegate_injection
+                .as_ref()
+                .and_then(|inj| inj.qodercli_entry.clone());
             if let Some(ref injected) = delegate_injection {
                 let mut s = state.write().await;
                 s.delegation_token = Some(injected.token.clone());
@@ -1838,6 +1843,7 @@ async fn run_connection(
                                     agent_type,
                                     &cwd,
                                     mcp_servers.clone(),
+                                    qodercli_entry.clone(),
                                 ) {
                             SessionNewRequest::Typed(req) => {
                                 cx.send_request_to(Agent, req).block_task().await?
@@ -1918,7 +1924,7 @@ async fn run_connection(
                 }
             } else {
                 // Create new session
-                let new_resp = match build_new_session_request(agent_type, &cwd, mcp_servers.clone()) {
+                let new_resp = match build_new_session_request(agent_type, &cwd, mcp_servers.clone(), qodercli_entry.clone()) {
                     SessionNewRequest::Typed(req) => {
                         cx.send_request_to(Agent, req).block_task().await?
                     }
@@ -4267,9 +4273,9 @@ mod tests {
     #[test]
     fn build_new_session_request_sets_claude_raw_meta() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
-        let req = match build_new_session_request(AgentType::ClaudeCode, &cwd, Vec::new()) {
+        let req = match build_new_session_request(AgentType::ClaudeCode, &cwd, Vec::new(), None) {
             SessionNewRequest::Typed(r) => r,
-            _ => panic!("expected typed request for ClaudeCode"),
+            _ => unreachable!("expected typed request for ClaudeCode"),
         };
 
         assert_eq!(
